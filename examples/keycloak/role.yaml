@@ -1,0 +1,30 @@
+# Non-secret, isolated SSH lab example for the experimental Keycloak connector.
+# Apply only to disposable lab resources; review OS permissions separately.
+kind: role
+version: v8
+metadata:
+  name: keycloak-lab-ssh
+  description: SSH access to the Keycloak lab as the unprivileged lab-user account.
+spec:
+  options:
+    max_session_ttl: 5m
+    client_idle_timeout: 2m
+    disconnect_expired_cert: true
+    lock: strict
+    forward_agent: false
+    ssh_port_forwarding:
+      local:
+        enabled: false
+      remote:
+        enabled: false
+    permit_x11_forwarding: false
+    ssh_file_copy: false
+    record_session:
+      ssh: strict
+  allow:
+    logins: [lab-user]
+    node_labels:
+      environment: lab
+      purpose: keycloak-ssh
+  deny:
+    logins: [root]

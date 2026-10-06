@@ -4208,6 +4208,29 @@ func (a *ScopedServerWithRoles) generateUserCerts(ctx context.Context, req proto
 		return nil, trace.AccessDenied("access denied")
 	}
 
+	var keycloakExpires time.Time
+	// Keycloak credentials are bounded by the original IdP login. Native
+	// resource-specific reissue may otherwise issue a new full role TTL.
+	if IsKeycloakUser(user) || IsKeycloakUser(a.scopedContext.User) {
+		identity := a.scopedContext.Identity.GetIdentity()
+		if err := a.authServer.checkKeycloakRoles(ctx, user.GetName(), identity.Groups); err != nil {
+			return nil, err
+		}
+		if req.Username != a.scopedContext.User.GetName() || isRoleImpersonation(req) || len(req.AccessRequests) != 0 || len(req.DropAccessRequests) != 0 {
+			return nil, trace.AccessDenied("Keycloak role changes require a fresh login")
+		}
+		if identity.Expires.IsZero() || user.Expiry().IsZero() {
+			return nil, trace.AccessDenied("Keycloak identity has no expiry")
+		}
+		if req.Expires.After(identity.Expires) {
+			req.Expires = identity.Expires
+		}
+		if req.Expires.After(user.Expiry()) {
+			req.Expires = user.Expiry()
+		}
+		keycloakExpires = req.Expires
+	}
+
 	// Note that user and their login states can be out of sync in the backend.
 	// For example, GitHub identities obtained from GitHub proxy OAuth flow are
 	// preserved in user login state, where local users may get updated roles
@@ -4428,6 +4451,27 @@ func (a *ScopedServerWithRoles) generateUserCerts(ctx context.Context, req proto
 
 	var appSessionID string
 	var webSessionID string
+	keycloakIssued := false
+	defer func() {
+		// Auxiliary sessions are persisted before final certificate signing.
+		// Never leave one behind when a bounded Keycloak issuance fails.
+		if keycloakExpires.IsZero() || keycloakIssued {
+			return
+		}
+		if appSessionID != "" {
+			_ = a.authServer.DeleteAppSession(context.WithoutCancel(ctx), types.DeleteAppSessionRequest{SessionID: appSessionID})
+		}
+		if webSessionID != "" {
+			_ = a.authServer.Services.WebSessions().Delete(context.WithoutCancel(ctx), types.DeleteWebSessionRequest{User: req.Username, SessionID: webSessionID})
+		}
+	}()
+	auxiliaryTTL := func() time.Duration {
+		ttl := req.Expires.Sub(a.authServer.GetClock().Now())
+		if !keycloakExpires.IsZero() {
+			ttl -= time.Second
+		}
+		return ttl
+	}
 	if req.RouteToApp.Name != "" {
 		// Create a new app session using the same cert request. The user certs
 		// generated below will be linked to this session by the session ID.
@@ -4435,7 +4479,7 @@ func (a *ScopedServerWithRoles) generateUserCerts(ctx context.Context, req proto
 			NewWebSessionRequest: sessionreq.NewWebSessionRequest{
 				User:           req.Username,
 				LoginIP:        a.scopedContext.Identity.GetIdentity().LoginIP,
-				SessionTTL:     req.Expires.Sub(a.authServer.GetClock().Now()),
+				SessionTTL:     auxiliaryTTL(),
 				Traits:         accessInfo.Traits,
 				Roles:          accessInfo.Roles,
 				AccessRequests: req.AccessRequests,
@@ -4477,13 +4521,18 @@ func (a *ScopedServerWithRoles) generateUserCerts(ctx context.Context, req proto
 			return nil, trace.Wrap(err)
 		}
 		appSessionID = ws.GetName()
+		if !keycloakExpires.IsZero() {
+			if err := keycloakSessionExpiry(ws, keycloakExpires); err != nil {
+				return nil, trace.Wrap(err)
+			}
+		}
 	} else if req.Usage == proto.UserCertsRequest_AccessGraphAPI {
 		// If usage is AccessGraphAPI, we need to create a web session
 		// so that the proxy can create a client to auth to report usage metrics.
 		// The user won't have the cookie so he could not use it.
 		wsSession, err := a.authServer.CreateWebSessionFromReq(ctx, NewWebSessionRequest{
 			User:             req.Username,
-			SessionTTL:       req.Expires.Sub(a.authServer.GetClock().Now()),
+			SessionTTL:       auxiliaryTTL(),
 			LoginIP:          a.scopedContext.Identity.GetIdentity().LoginIP,
 			Roles:            accessInfo.Roles,
 			Traits:           accessInfo.Traits,
@@ -4496,6 +4545,11 @@ func (a *ScopedServerWithRoles) generateUserCerts(ctx context.Context, req proto
 			return nil, trace.Wrap(err)
 		}
 		webSessionID = wsSession.GetName()
+		if !keycloakExpires.IsZero() {
+			if err := keycloakSessionExpiry(wsSession, keycloakExpires); err != nil {
+				return nil, trace.Wrap(err)
+			}
+		}
 	}
 
 	var checkerCtx *services.ScopedAccessCheckerContext
@@ -4553,6 +4607,13 @@ func (a *ScopedServerWithRoles) generateUserCerts(ctx context.Context, req proto
 		// identity.
 		JoinAttributes: a.scopedContext.Identity.GetIdentity().JoinAttributes,
 		WebSessionID:   webSessionID,
+	}
+
+	if !keycloakExpires.IsZero() {
+		certReq.TTL -= time.Second
+		if certReq.TTL <= 0 {
+			return nil, trace.AccessDenied("Keycloak identity expires too soon")
+		}
 	}
 
 	if user.GetName() != a.scopedContext.User.GetName() {
@@ -4652,6 +4713,12 @@ func (a *ScopedServerWithRoles) generateUserCerts(ctx context.Context, req proto
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	if !keycloakExpires.IsZero() {
+		if err := keycloakCertificateExpiry(certs.SSH, certs.TLS, keycloakExpires); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+	keycloakIssued = true
 
 	return certs, nil
 }
@@ -4824,11 +4891,8 @@ func (a *ServerWithRoles) UpsertOIDCConnector(ctx context.Context, connector typ
 	if err := a.authConnectorAction(types.KindOIDC, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
-		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
-		// we can't currently propagate wrapped errors across the gRPC boundary,
-		// and we want tctl to display a clean user-facing message in this case
-		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+	if err := a.authServer.checkOIDCConnectorCapability(connector); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	// Support reused MFA for bulk tctl create requests.
@@ -4845,11 +4909,8 @@ func (a *ServerWithRoles) UpdateOIDCConnector(ctx context.Context, connector typ
 	if err := a.authConnectorAction(types.KindOIDC, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
-		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
-		// we can't currently propagate wrapped errors across the gRPC boundary,
-		// and we want tctl to display a clean user-facing message in this case
-		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+	if err := a.authServer.checkOIDCConnectorCapability(connector); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	if err := a.context.AuthorizeAdminActionAllowReusedMFA(); err != nil {
@@ -4865,11 +4926,8 @@ func (a *ServerWithRoles) CreateOIDCConnector(ctx context.Context, connector typ
 	if err := a.authConnectorAction(types.KindOIDC, types.VerbCreate); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
-		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
-		// we can't currently propagate wrapped errors across the gRPC boundary,
-		// and we want tctl to display a clean user-facing message in this case
-		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+	if err := a.authServer.checkOIDCConnectorCapability(connector); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	// Support reused MFA for bulk tctl create requests.
@@ -4927,11 +4985,8 @@ func (a *ServerWithRoles) ListOIDCConnectors(ctx context.Context, limit int, sta
 }
 
 func (a *ServerWithRoles) CreateOIDCAuthRequest(ctx context.Context, req types.OIDCAuthRequest) (*types.OIDCAuthRequest, error) {
-	if !modules.GetModules().Features().GetEntitlement(entitlements.OIDC).Enabled {
-		// TODO(zmb3): ideally we would wrap ErrRequiresEnterprise here, but
-		// we can't currently propagate wrapped errors across the gRPC boundary,
-		// and we want tctl to display a clean user-facing message in this case
-		return nil, trace.AccessDenied("OIDC is only available in Teleport Enterprise")
+	if !a.authServer.hasOIDCLoginCapability() {
+		return nil, trace.AccessDenied("OIDC login is not enabled")
 	}
 
 	if err := a.authorizeAction(types.KindOIDCRequest, types.VerbCreate); err != nil {

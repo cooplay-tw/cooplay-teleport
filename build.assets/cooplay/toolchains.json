@@ -1,0 +1,11 @@
+{
+  "go": "go1.25.14",
+  "node": "24.20.0",
+  "rust": "1.94.0",
+  "ui_linux_arm64": "ghcr.io/gravitational/teleport-buildbox-node@sha256:7d911f2a946c1b68929d3b473f8aa104dcd002a7317efce87afbf0218265cc37",
+  "keycloak": "quay.io/keycloak/keycloak@sha256:b0f60d489d51c5d113390bdf5461d4c06e6051be026c05549f2e1e10ec352bcc",
+  "k3s": "rancher/k3s@sha256:ec9868c6a38d4e8c1869832fb5fd1eb8473c39794a0b44d2b952e7ba911951bc",
+  "k3s_version": "v1.35.9+k3s1",
+  "busybox": "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e",
+  "kube_agent_runtime": "gcr.io/distroless/base-debian13@sha256:a0d70d6a97cd697d9362bc2aae4a6560dd65817e365d0043b07325a97975dc91"
+}

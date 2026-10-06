@@ -811,6 +811,9 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*APIHandler, error) {
 	})
 
 	h.NotFound = notFoundRoutingHandler
+	if auth.KeycloakSSOEnabled() && !cfg.MinimalReverseTunnelRoutesOnly {
+		h.RegisterKeycloakHandlers()
+	}
 
 	if cfg.PluginRegistry != nil {
 		if err := cfg.PluginRegistry.RegisterProxyWebHandlers(h); err != nil {
@@ -3016,8 +3019,20 @@ func (h *Handler) deleteWebSession(w http.ResponseWriter, r *http.Request, _ htt
 		}
 	}
 
+	var keycloakLogoutErr error
+	if auth.IsKeycloakUser(user) || strings.HasPrefix(ctx.GetUser(), "keycloak-") {
+		if clt == nil {
+			keycloakLogoutErr = trace.ConnectionProblem(nil, "Keycloak revocation unavailable")
+		} else {
+			keycloakLogoutErr = clt.KeycloakLogout(r.Context(), authclient.KeycloakLogoutRequest{})
+		}
+	}
 	if err := h.logout(r.Context(), w, ctx); err != nil {
 		return nil, trace.Wrap(err)
+	}
+
+	if keycloakLogoutErr != nil {
+		return nil, trace.ConnectionProblem(nil, "Local session cleared; Keycloak credential revocation was not confirmed")
 	}
 
 	// If the user has SAML SLO (single logout) configured, return a redirect link to the SLO URL.

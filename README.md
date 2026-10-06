@@ -1,3 +1,7 @@
+Cooplay fork: see the [Keycloak SSO candidate](docs/keycloak/README.md)
+for the fixed upstream baseline, implementation boundary, local validation,
+license notes, and deployment blockers. The extension is disabled by default.
+
 Teleport provides connectivity, authentication, access controls and audit for infrastructure.
 
 Here is why you might use Teleport:

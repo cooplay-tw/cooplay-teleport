@@ -2800,6 +2800,7 @@ func onLogout(cf *CLIConf) error {
 		proxyHost = cf.Proxy
 	}
 
+	var keycloakLogoutErr error
 	switch {
 	// Proxy and username for key to remove.
 	case proxyHost != "":
@@ -2852,6 +2853,8 @@ func onLogout(cf *CLIConf) error {
 				}
 			}
 		}
+
+		keycloakLogoutErr = tc.RevokeKeycloakLogin(cf.Context)
 
 		// Remove keys for this user from disk and running agent.
 		err = tc.Logout()
@@ -2955,6 +2958,10 @@ func onLogout(cf *CLIConf) error {
 			fmt.Fprintf(cf.Stdout(), "We were unable to log you out of your SAML identity provider: %v\n", err)
 		}
 
+		keycloakLogoutErr = forEachProfileParallel(cf, func(ctx context.Context, tc *client.TeleportClient, _ *client.ProfileStatus) error {
+			return tc.RevokeKeycloakLogin(ctx)
+		})
+
 		// Remove all keys from disk and the running agent.
 		err = tc.LogoutAll()
 		if err != nil {
@@ -2964,6 +2971,9 @@ func onLogout(cf *CLIConf) error {
 		fmt.Fprintf(cf.Stdout(), "Logged out all users from all proxies.\n")
 	case proxyHost == "" && cf.Username != "":
 		fmt.Fprintf(cf.Stdout(), "Specify --proxy to log out user %q from a specific proxy or remove the --user flag to log out all users from all proxies.\n", cf.Username)
+	}
+	if keycloakLogoutErr != nil {
+		return trace.ConnectionProblem(nil, "Local credentials cleared; Keycloak credential revocation was not confirmed")
 	}
 	return nil
 }

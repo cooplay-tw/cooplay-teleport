@@ -998,6 +998,7 @@ type GithubAuthRequest struct {
 
 // IdentityService manages identities and users
 type IdentityService interface {
+	KeycloakLogout(context.Context, KeycloakLogoutRequest) error
 	// CreateOIDCConnector creates a new OIDC connector.
 	CreateOIDCConnector(ctx context.Context, connector types.OIDCConnector) (types.OIDCConnector, error)
 	// UpdateOIDCConnector updates an existing OIDC connector.

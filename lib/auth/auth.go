@@ -975,6 +975,16 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (as *Server, err error) {
 		as.logger.WarnContext(closeCtx, "Auth server starting without cache (may have negative performance implications)")
 	}
 
+	if KeycloakSSOEnabled() {
+		svc, err := loadKeycloakLifecycle(as)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		as.SetOIDCService(svc)
+		go svc.runLifecycle(closeCtx)
+		as.logger.WarnContext(closeCtx, "Cooplay Keycloak SSO enabled with managed lifecycle")
+	}
+
 	return as, nil
 }
 
@@ -5255,11 +5265,38 @@ func (a *Server) ExtendWebSession(ctx context.Context, req authclient.WebSession
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	// The experimental connector requires a fresh IdP login for role changes.
+	// Switchback can otherwise extend an externally bounded session to role TTL.
+	var keycloakExpires time.Time
+	if strings.HasPrefix(req.User, keycloakUserPrefix) || req.Switchback || req.ReloadUser || req.AccessRequestID != "" {
+		user, err := a.GetUser(ctx, req.User, false)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		if IsKeycloakUser(user) {
+			if err := a.checkKeycloakRoles(ctx, user.GetName(), identity.Groups); err != nil {
+				return nil, err
+			}
+			if req.Switchback || req.ReloadUser || req.AccessRequestID != "" {
+				return nil, trace.AccessDenied("Keycloak role changes require a fresh login")
+			}
+			if user.Expiry().IsZero() || identity.Expires.IsZero() {
+				return nil, trace.AccessDenied("Keycloak identity has no expiry")
+			}
+			keycloakExpires = user.Expiry()
+			if identity.Expires.Before(keycloakExpires) {
+				keycloakExpires = identity.Expires
+			}
+		}
+	}
 
 	// consider absolute expiry time that may be set for this session
 	// by some external identity service, so we can not renew this session
 	// anymore without extra logic for renewal with external OIDC provider
 	expiresAt := prevSession.GetExpiryTime()
+	if !keycloakExpires.IsZero() && (expiresAt.IsZero() || keycloakExpires.Before(expiresAt)) {
+		expiresAt = keycloakExpires
+	}
 	if !expiresAt.IsZero() && expiresAt.Before(a.clock.Now().UTC()) {
 		return nil, trace.NotFound("web session has expired")
 	}
@@ -5370,6 +5407,14 @@ func (a *Server) ExtendWebSession(ctx context.Context, req authclient.WebSession
 	}
 
 	sessionTTL := utils.ToTTL(a.clock, expiresAt)
+	if !keycloakExpires.IsZero() {
+		// Native APIs use durations; reserve signing time and verify the
+		// actual result below against the unchanged absolute deadline.
+		sessionTTL -= time.Second
+		if sessionTTL <= 0 {
+			return nil, trace.AccessDenied("Keycloak identity expires too soon")
+		}
+	}
 	sess, _, err := a.newWebSession(ctx, NewWebSessionRequest{
 		User:                       req.User,
 		LoginIP:                    identity.LoginIP,
@@ -5383,6 +5428,13 @@ func (a *Server) ExtendWebSession(ctx context.Context, req authclient.WebSession
 	}, opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
+	}
+
+	if !keycloakExpires.IsZero() {
+		if err := keycloakSessionExpiry(sess, expiresAt); err != nil {
+			// newWebSession has not persisted this rejected renewal.
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	// Keep preserving the login time.

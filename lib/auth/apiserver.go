@@ -167,6 +167,9 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 
 	// SSO validation handlers
 	srv.POST("/:version/github/requests/validate", srv.WithAuth(srv.validateGithubAuthCallback))
+	if KeycloakSSOEnabled() {
+		srv.RegisterKeycloakHandlers()
+	}
 
 	// Migrated/deleted endpoints with 501 Not Implemented handlers.
 	srv.POST("/:version/reversetunnels", httpMigratedHandler)

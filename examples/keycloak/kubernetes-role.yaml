@@ -1,0 +1,28 @@
+# Non-secret disposable cluster example. Kubernetes RBAC is a second boundary.
+kind: role
+version: v8
+metadata:
+  name: keycloak-lab-kube
+spec:
+  options:
+    max_session_ttl: 5m
+    disconnect_expired_cert: true
+    lock: strict
+    forward_agent: false
+    ssh_file_copy: false
+    ssh_port_forwarding:
+      local: {enabled: false}
+      remote: {enabled: false}
+    record_session: {ssh: strict}
+  allow:
+    kubernetes_labels:
+      environment: lab
+      purpose: keycloak-kube
+    kubernetes_users: [keycloak-lab]
+    kubernetes_groups: [keycloak-lab-readers]
+    kubernetes_resources:
+      - {kind: pods, namespace: lab-allowed, name: '*', api_group: '', verbs: [get, list, watch]}
+      - {kind: pods, namespace: lab-allowed, name: demo, api_group: '', verbs: [exec]}
+  deny:
+    kubernetes_resources:
+      - {kind: secrets, namespace: '*', name: '*', api_group: '', verbs: ['*']}

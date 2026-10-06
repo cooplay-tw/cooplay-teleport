@@ -1,0 +1,79 @@
+name: Cooplay Keycloak candidate
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'lib/auth/**'
+      - 'lib/web/**'
+      - 'lib/client/**'
+      - 'lib/cooplay/**'
+      - 'lib/srv/**'
+      - 'tool/tsh/**'
+      - 'tool/cooplay-*/**'
+      - 'build.assets/cooplay/**'
+      - 'examples/keycloak/**'
+      - '.github/workflows/cooplay-keycloak.yml'
+      - 'go.mod'
+      - 'go.sum'
+      - 'api/**'
+      - 'web/**'
+      - 'pnpm-lock.yaml'
+      - 'Cargo.lock'
+permissions:
+  contents: read
+jobs:
+  authorization:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with: {go-version: '1.25.14', cache: true}
+      - run: bash build.assets/cooplay/keycloak.sh test
+      - run: go test -race -mod=readonly -count=1 ./lib/auth ./lib/web ./lib/cooplay/secrets ./tool/cooplay-backup ./tool/cooplay-secrets
+      - run: git diff --exit-code && git diff --check
+  full-candidate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with: {go-version: '1.25.14', cache: true}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with: {node-version: '24.20.0'}
+      - name: Use task-local caches
+        run: |
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+      - name: Build full UI twice and compare every asset
+        run: |
+          bash build.assets/cooplay/full-build.sh ui
+          find webassets/teleport -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/ui-first.sha256
+          bash build.assets/cooplay/full-build.sh ui
+          sha256sum --check /tmp/ui-first.sha256
+      - name: Build Linux binaries twice and compare every artifact
+        run: |
+          bash build.assets/cooplay/full-build.sh linux
+          cp build/cooplay-candidate/linux-arm64/manifest.json /tmp/candidate-first.json
+          bash build.assets/cooplay/full-build.sh linux
+          python3 - <<'PY'
+          import json
+          a = json.load(open('/tmp/candidate-first.json'))['artifacts']
+          b = json.load(open('build/cooplay-candidate/linux-arm64/manifest.json'))['artifacts']
+          assert a == b, 'repeat build produced different artifacts'
+          PY
+      - name: Install the lockfile-pinned isolated browser
+        run: node node_modules/.pnpm/playwright@1.62.1/node_modules/playwright/cli.js install --with-deps chromium
+      - name: Real Keycloak MFA, logout, SSH and Kubernetes acceptance
+        run: python3 build.assets/cooplay/real-keycloak-smoke.py
+      - run: git diff --exit-code && git diff --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: success()
+        with:
+          name: keycloak-candidate-provenance
+          path: |
+            build/cooplay-candidate/linux-arm64/manifest.json
+            build/cooplay-candidate/real-keycloak-result.json
+          retention-days: 14

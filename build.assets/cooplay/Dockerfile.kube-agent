@@ -1,0 +1,7 @@
+# Source-built Kubernetes agent only. SSH agents use the host OS installer.
+FROM gcr.io/distroless/base-debian13@sha256:a0d70d6a97cd697d9362bc2aae4a6560dd65817e365d0043b07325a97975dc91
+COPY --chmod=0755 teleport /usr/local/bin/teleport
+COPY --chmod=0644 manifest.json /usr/share/cooplay/manifest.json
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/teleport"]
+CMD ["start", "--config=/etc/teleport/agent.json", "--no-debug-service"]

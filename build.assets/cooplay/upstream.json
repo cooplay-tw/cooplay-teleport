@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/gravitational/teleport",
+  "tag": "v18.11.1",
+  "commit": "27eb07217a0efca4a5d2dd88bce7472cba5f406a",
+  "go": "go1.25.14",
+  "status": "local-deployment-candidate-not-deployed",
+  "verified_date": "2026-10-07",
+  "note": "v18.11.2 is advertised in the upstream changelog but was absent from upstream git ls-remote at selection time. Recheck tags and advisories before any rollout."
+}
