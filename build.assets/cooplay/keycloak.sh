@@ -16,7 +16,7 @@ test "$(go env GOARCH)" = "$(go env GOHOSTARCH)"
 case "${1:-test}" in
   test)
     python3 -m unittest discover -s build.assets/cooplay -p 'test_*.py'
-    go test -mod=readonly -count=1 ./lib/cooplay/secrets ./tool/cooplay-backup ./tool/cooplay-secrets
+    go test -mod=readonly -count=1 ./lib/cooplay/secrets
     go test -mod=readonly -count=1 -timeout=15m ./lib/auth ./lib/web ./lib/srv \
       -run 'TestKeycloak|TestGenerateUserCertWithLocks|TestUpsertDeleteLockEventsEmitted|TestCloseConnectionsOnLogout|TestApplicationWebSessionsDeletedAfterLogout|TestConnectionMonitorLockInForce|TestMonitorLockInForce|TestMonitorStaleLocks|TestMonitorDisconnectExpiredCertBeforeTimeNow|TestWebSessionWithoutAccessRequest|TestWebSessionMultiAccessRequests|TestWebSessionWithApprovedAccessRequestAndSwitchback|TestExtendWebSessionWithReloadUser|TestExtendWebSessionWithMaxDuration|TestGenerateUserCertsWithRoleRequest'
     ;;

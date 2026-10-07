@@ -168,6 +168,12 @@ subjectAltName=DNS:localhost,DNS:cooplay-proxy.test,IP:127.0.0.1
     def realm_fixture(self, fixture):
         return fixture
 
+    def keycloak_ready(self):
+        """Private deployment drills can start explicit HTTPS gateways here."""
+
+    def keycloak_port_options(self):
+        return ["--publish", f"127.0.0.1:{self.kcport}:{self.kcport}", "--publish", f"127.0.0.1:{self.proxyport}:{self.proxyport}"]
+
     def start_keycloak(self):
         self.stage = "start digest-pinned Keycloak"
         fixture = {"realm": "cooplay-smoke", "enabled": True, "sslRequired": "all", "accessTokenLifespan": 300,
@@ -198,14 +204,15 @@ subjectAltName=DNS:localhost,DNS:cooplay-proxy.test,IP:127.0.0.1
         self.result["keycloak_architecture"] = image["Architecture"]
         # The default unprivileged image user starts only after the copied
         # private fixture is assigned to its UID. No host directory is mounted.
-        command = "while [ ! -e /tmp/cooplay-ready ]; do sleep 0.1; done; exec /opt/keycloak/bin/kc.sh start-dev --http-enabled=false --https-port=" + str(self.kcport) + " --hostname=" + self.idp + " --truststore-paths=/tmp/cooplay-keycloak/ca.crt --https-certificate-file=/tmp/cooplay-keycloak/server.crt --https-certificate-key-file=/tmp/cooplay-keycloak/server.key --import-realm"
-        self.run(["docker", "create", "--name", self.container, "--memory=1g", "--publish", f"127.0.0.1:{self.kcport}:{self.kcport}", "--publish", f"127.0.0.1:{self.proxyport}:{self.proxyport}",
+        command = "while [ ! -e /tmp/cooplay-ready ]; do sleep 0.1; done; exec /opt/keycloak/bin/kc.sh start-dev --http-enabled=false --https-port=" + str(getattr(self,"keycloak_backend_port",self.kcport)) + " --hostname=" + self.idp + " --truststore-paths=/tmp/cooplay-keycloak/ca.crt --https-certificate-file=/tmp/cooplay-keycloak/server.crt --https-certificate-key-file=/tmp/cooplay-keycloak/server.key --import-realm"
+        self.run(["docker", "create", "--name", self.container, "--memory=1g", *self.keycloak_port_options(),
                   "--env-file", envfile, "--entrypoint=/bin/bash", IMAGE, "-c", command])
         self.created = True
         self.run(["docker", "cp", self.root / "kc", self.container + ":/tmp/cooplay-keycloak"])
         self.run(["docker", "start", self.container])
         self.run(["docker", "exec", "--user=0", self.container, "/bin/bash", "-c",
                   "mkdir -p /opt/keycloak/data/import && cp /tmp/cooplay-keycloak/realm.json /opt/keycloak/data/import/realm.json && chown -R 1000:0 /tmp/cooplay-keycloak /opt/keycloak/data/import && touch /tmp/cooplay-ready"])
+        self.keycloak_ready()
         self.wait_http(self.issuer + "/.well-known/openid-configuration", 180)
         self.check("real_issuer_discovery_verified_tls", True)
 
@@ -274,13 +281,13 @@ subjectAltName=DNS:localhost,DNS:cooplay-proxy.test,IP:127.0.0.1
     def admin(self, path, method="GET", payload=None):
         if not hasattr(self, "admin_token") or time.monotonic() >= self.admin_token_until:
             form = urllib.parse.urlencode({"client_id": "admin-cli", "grant_type": "password", "username": "lab-admin", "password": self.admin_password}).encode()
-            request = urllib.request.Request(self.idp + "/realms/master/protocol/openid-connect/token", form)
+            request = urllib.request.Request(getattr(self,"operator_idp",self.idp) + "/realms/master/protocol/openid-connect/token", form)
             with self.http.open(request, timeout=30) as response:
                 value = json.load(response)
                 self.admin_token = value["access_token"]
                 self.admin_token_until = time.monotonic() + max(1, value["expires_in"] - 10)
         data = None if payload is None else json.dumps(payload).encode()
-        request = urllib.request.Request(self.idp + "/admin/realms/cooplay-smoke/" + path, data, method=method,
+        request = urllib.request.Request(getattr(self,"operator_idp",self.idp) + "/admin/realms/cooplay-smoke/" + path, data, method=method,
                                          headers={"Authorization": "Bearer " + self.admin_token, "Content-Type": "application/json"})
         with self.http.open(request, timeout=30) as response:
             body = response.read()

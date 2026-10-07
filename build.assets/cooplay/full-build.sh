@@ -54,7 +54,7 @@ case "${1:-all}" in
     rm "$output_dir/.sessionhelper"
     build_tags="$build_tags,sessionhelper_embed"
   fi
-  for binary in teleport tsh tctl cooplay-secrets cooplay-backup; do
+  for binary in teleport tsh tctl; do
     go build -p=4 -mod=readonly -trimpath -buildvcs=false \
       -tags="$build_tags" \
       -ldflags "-X github.com/gravitational/teleport.Gitref=$(git rev-parse HEAD)" \
@@ -62,20 +62,25 @@ case "${1:-all}" in
   done
   python3 build.assets/cooplay/manifest.py --output "$output_dir" --profile full-ui-keycloak-candidate
   ;;
- linux)
+ linux|linux-amd64)
+  target_arch=arm64
+  if [ "$1" = linux-amd64 ]; then
+    target_arch=amd64
+    ui_image=$(python3 -c 'import json; print(json.load(open("build.assets/cooplay/toolchains.json"))["linux_amd64"])')
+  fi
   test -s webassets/teleport/index.html
   : "${GOMODCACHE:?set a task-local Go module cache}"
   : "${GOCACHE:?set a task-local Go build cache}"
-  go mod download golang.org/toolchain@v0.0.1-go1.25.14.linux-arm64
-  linux_go="$GOMODCACHE/golang.org/toolchain@v0.0.1-go1.25.14.linux-arm64"
+  go mod download golang.org/toolchain@v0.0.1-go1.25.14.linux-$target_arch
+  linux_go="$GOMODCACHE/golang.org/toolchain@v0.0.1-go1.25.14.linux-$target_arch"
   chmod u+x "$linux_go/bin/go" "$linux_go/bin/gofmt"
   find "$linux_go/pkg/tool" -type f -exec chmod u+x {} \;
-  mkdir -p "$GOCACHE/linux-arm64"
-  docker run --rm --platform=linux/arm64 --user=0 \
+  mkdir -p "$GOCACHE/linux-$target_arch"
+  docker run --rm --platform=linux/$target_arch --user=0 \
     --mount "type=bind,source=$repo_dir,target=/workspace" --workdir=/workspace \
     --mount "type=bind,source=$linux_go,target=/opt/go,readonly" \
     --mount "type=bind,source=$GOMODCACHE,target=/gomod" \
-    --mount "type=bind,source=$GOCACHE/linux-arm64,target=/gocache" \
+    --mount "type=bind,source=$GOCACHE/linux-$target_arch,target=/gocache" \
     --env GIT_CONFIG_COUNT=1 --env GIT_CONFIG_KEY_0=safe.directory --env GIT_CONFIG_VALUE_0=/workspace \
     --env GOMODCACHE=/gomod --env GOCACHE=/gocache --env GOROOT=/opt/go \
     --env PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -85,6 +90,7 @@ case "${1:-all}" in
   bash build.assets/cooplay/full-build.sh ui
   bash build.assets/cooplay/full-build.sh native
   bash build.assets/cooplay/full-build.sh linux
+  bash build.assets/cooplay/full-build.sh linux-amd64
   ;;
- *) echo 'Usage: full-build.sh [ui|native|linux|all]' >&2; exit 2 ;;
+ *) echo 'Usage: full-build.sh [ui|native|linux|linux-amd64|all]' >&2; exit 2 ;;
 esac

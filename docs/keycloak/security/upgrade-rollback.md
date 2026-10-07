@@ -10,7 +10,7 @@ administration are required.
 Use the exact public fork commit, unchanged dependency locks, pinned Go/Linux
 builder/UI toolchain and normal full-UI recipe. Preserve LICENSE and third-party
 notices plus corresponding source. The manifest records source revision, dirty
-state, compiler, dependency/asset hashes and all five binary hashes. The private
+state, compiler, dependency/asset hashes and all three Teleport binary hashes. The private
 installer requires an **independently pinned manifest SHA-256**, matching host
 platform, clean source and exact artifact hashes, and writes a new release only.
 A local `--allow-dirty-lab` exception cannot be used as release provenance.
@@ -84,3 +84,27 @@ v18→v19 database downgrade needs a new version-specific drill.
 Account suspension remains permanent for the old issuer/subject. Re-enabling it
 or deleting a native lock cannot erase its journal record. A reviewed new-subject
 onboarding preserves the old history and requires fresh MFA/group approval.
+
+## Hybrid deployment configuration migration
+
+Before activating this revision, supply `client_id`, an explicit same-realm HTTPS
+`admin_url` and file-only secret references in Auth-local managed configuration.
+Old AWS ARN fields now fail startup; there is no provider fallback. Move provider
+materialization and encryption helpers to the private deployment tool release.
+Stage a persistent complete secret generation readable only by the service and
+validate the private Admin TLS chain before switching binaries/configuration.
+
+Public SSO must remain available independently of the private management path.
+The IdP must reach the restricted logout POST endpoint. Separate endpoint failures
+must be tested: polling now checks current client sessions, not only enabled/group
+state, so missed notifications cannot silently restore an ended login after health
+recovery. A probe with no current users must still fail when Admin access fails.
+
+On every restart all configured SSO connectors are fenced before serving. A live
+Proxy ping is **not** identity readiness: inspect connector sync metrics and native
+health locks. Wait for fresh reconciliation before judging an unrevoked restored
+credential. Independent local recovery administration is not an SSO health bypass.
+Rolling back to the earlier candidate requires restoring its old config schema;
+it lacks these private-endpoint and missed-session checks. Keep the management
+entry isolated, wait the maximum credential lifetime plus clock margin, and verify
+its network and revocation contract separately before reopening.

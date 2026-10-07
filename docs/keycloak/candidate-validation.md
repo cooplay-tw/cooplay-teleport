@@ -1,5 +1,9 @@
 # Candidate validation — 2026-10-07
 
+This is the historical first-candidate evidence. The current hybrid contract
+removes public deployment helpers and adds private Admin endpoints, startup
+fencing and authoritative session reconciliation; see [the current contract](README.md).
+
 This is local evidence, not production deployment or hosted CI approval. The
 maintained v18.11.1 baseline is fixed in [upstream.json](../../build.assets/cooplay/upstream.json).
 The implementation and supported deployment contract are in [README](README.md).

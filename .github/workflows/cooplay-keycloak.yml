@@ -9,7 +9,6 @@ on:
       - 'lib/cooplay/**'
       - 'lib/srv/**'
       - 'tool/tsh/**'
-      - 'tool/cooplay-*/**'
       - 'build.assets/cooplay/**'
       - 'examples/keycloak/**'
       - '.github/workflows/cooplay-keycloak.yml'
@@ -31,7 +30,7 @@ jobs:
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with: {go-version: '1.25.14', cache: true}
       - run: bash build.assets/cooplay/keycloak.sh test
-      - run: go test -race -mod=readonly -count=1 ./lib/auth ./lib/web ./lib/cooplay/secrets ./tool/cooplay-backup ./tool/cooplay-secrets
+      - run: go test -race -mod=readonly -count=1 ./lib/auth ./lib/web ./lib/cooplay/secrets
       - run: git diff --exit-code && git diff --check
   full-candidate:
     runs-on: ubuntu-24.04-arm

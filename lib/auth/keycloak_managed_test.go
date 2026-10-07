@@ -3,9 +3,17 @@
 package auth_test
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +32,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type keycloakAdminFixture struct{ disabled, removed, unavailable atomic.Bool }
+type keycloakAdminFixture struct{ disabled, removed, unavailable, ended, brokenSessions atomic.Bool }
 
 func managedKeycloakFixture(t *testing.T) (*keycloakFixture, *keycloakAdminFixture, auth.KeycloakLifecycleConfig) {
 	t.Helper()
@@ -50,6 +58,21 @@ func managedKeycloakFixture(t *testing.T) (*keycloakFixture, *keycloakAdminFixtu
 			return
 		}
 		switch r.URL.Path {
+		case "/admin/realms/lab/users/count":
+			_, _ = w.Write([]byte(`1`))
+		case "/admin/realms/lab/users/immutable-subject/sessions":
+			if admin.brokenSessions.Load() {
+				_, _ = w.Write([]byte(`null`))
+				return
+			}
+			sessions := []map[string]any{}
+			for _, sid := range []string{"sid-a", "sid-b", "sid-c", "sid-new"} {
+				if admin.ended.Load() && sid == "sid-a" {
+					continue
+				}
+				sessions = append(sessions, map[string]any{"id": sid, "userId": "immutable-subject", "clients": map[string]string{"uuid": "teleport-lab"}})
+			}
+			_ = json.NewEncoder(w).Encode(sessions)
 		case "/admin/realms/lab/users/immutable-subject":
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "immutable-subject", "enabled": !admin.disabled.Load()})
 		case "/admin/realms/lab/users/immutable-subject/groups":
@@ -67,7 +90,7 @@ func managedKeycloakFixture(t *testing.T) (*keycloakFixture, *keycloakAdminFixtu
 	ca := filepath.Join(dir, "ca.pem")
 	require.NoError(t, os.WriteFile(secret, []byte(keycloakTestSecret), 0600))
 	require.NoError(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.idp.Certificate().Raw}), 0600))
-	cfg := auth.KeycloakLifecycleConfig{CAFile: ca, RevocationJournalDir: filepath.Join(dir, "journal"), PollSeconds: 1, MaxStaleSeconds: 2, Connectors: map[string]auth.KeycloakLifecycleConnector{"keycloak-lab": {Issuer: f.idp.URL + "/realms/lab", ClientSecret: secrets.Reference{File: secret}, AdminClientID: "sync-lab", AdminClientSecret: secrets.Reference{File: secret}}}}
+	cfg := auth.KeycloakLifecycleConfig{CAFile: ca, RevocationJournalDir: filepath.Join(dir, "journal"), PollSeconds: 1, MaxStaleSeconds: 2, Connectors: map[string]auth.KeycloakLifecycleConnector{"keycloak-lab": {Issuer: f.idp.URL + "/realms/lab", ClientID: "teleport-lab", AdminURL: f.idp.URL + "/admin/realms/lab", ClientSecret: secrets.Reference{File: secret}, AdminClientID: "sync-lab", AdminClientSecret: secrets.Reference{File: secret}}}}
 	var err error
 	f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
 	require.NoError(t, err)
@@ -274,4 +297,142 @@ func TestKeycloakManagedBackchannelValidationAndReplay(t *testing.T) {
 	_, q := f.begin(t, true, func(c map[string]any) { c["sid"] = "sid-a" })
 	_, err = f.svc.ValidateOIDCAuthCallback(f.ctx, q)
 	require.Error(t, err, "logout arriving before callback must prevent issuance")
+}
+
+// A previously healthy backend must not make a restarted Auth trust old health.
+// A missed IdP notification is recovered using read-only client session state.
+func TestKeycloakManagedStartupFenceAndMissedLogout(t *testing.T) {
+	f, admin, cfg := managedKeycloakFixture(t)
+	first, roles := managedLogin(t, f, "sid-a")
+	_, independent := managedLogin(t, f, "sid-b")
+	restarted, err := auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	f.svc = restarted
+	f.a.AuthServer.SetOIDCService(restarted)
+	var guard, marker string
+	for _, r := range roles {
+		if strings.HasPrefix(r, "keycloak-guard-") {
+			guard = r
+		}
+		if strings.HasPrefix(r, "keycloak-login-") {
+			marker = r
+		}
+	}
+	locks, err := f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: guard})
+	require.NoError(t, err)
+	require.Len(t, locks, 1, "constructor must fence before background reconciliation")
+	admin.unavailable.Store(true)
+	require.Error(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	_, q := f.begin(t, true, func(c map[string]any) { c["sid"] = "sid-new" })
+	_, err = f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+	require.Error(t, err)
+	admin.unavailable.Store(false)
+	admin.ended.Store(true)
+	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	locks, err = f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: marker})
+	require.NoError(t, err)
+	require.Len(t, locks, 1)
+	require.Contains(t, locks[0].Message(), "idp-session-ended")
+	locks, err = f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: guard})
+	require.NoError(t, err)
+	require.Empty(t, locks)
+	for _, role := range independent {
+		locks, err = f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: role})
+		require.NoError(t, err)
+		require.Empty(t, locks, "independent active login survives")
+	}
+	locks, err = f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{User: first.Username})
+	require.NoError(t, err)
+	require.Empty(t, locks, "session logout never suspends account")
+	_, q = f.begin(t, true, func(c map[string]any) { c["sid"] = "sid-a" })
+	_, err = f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+	require.Error(t, err, "ended session cannot finish callback")
+	managedLogin(t, f, "sid-new")
+}
+
+func TestKeycloakManagedEmptyHealthAndMalformedSession(t *testing.T) {
+	f, admin, _ := managedKeycloakFixture(t)
+	admin.unavailable.Store(true)
+	f.clock.Advance(3 * time.Second)
+	require.Error(t, auth.ReconcileKeycloak(f.ctx, f.svc), "zero users must still probe private Admin API")
+	admin.unavailable.Store(false)
+	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	_, roles := managedLogin(t, f, "sid-a")
+	admin.brokenSessions.Store(true)
+	require.Error(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	for _, role := range roles {
+		if strings.HasPrefix(role, "keycloak-login-") {
+			locks, err := f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: role})
+			require.NoError(t, err)
+			require.Empty(t, locks, "null/partial API data cannot become durable logout")
+		}
+	}
+}
+
+func TestKeycloakManagedPrivateAdminOrigin(t *testing.T) {
+	f, _, cfg := managedKeycloakFixture(t)
+	original := f.adminHandler
+	private := httptest.NewTLSServer(original)
+	t.Cleanup(private.Close)
+	f.adminHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/admin/") {
+			w.WriteHeader(403)
+			return
+		}
+		original.ServeHTTP(w, r)
+	})
+	ca, err := os.OpenFile(cfg.CAFile, os.O_APPEND|os.O_WRONLY, 0600)
+	require.NoError(t, err)
+	_, err = ca.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: private.Certificate().Raw}))
+	require.NoError(t, err)
+	require.NoError(t, ca.Close())
+	connector := cfg.Connectors["keycloak-lab"]
+	connector.AdminURL = private.URL + "/admin/realms/lab"
+	cfg.Connectors["keycloak-lab"] = connector
+	f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	f.a.AuthServer.SetOIDCService(f.svc)
+	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	managedLogin(t, f, "sid-a")
+	// The private origin is explicit, but its redirects must never forward the
+	// service bearer to another endpoint (even if that endpoint has trusted TLS).
+	var forwarded atomic.Int32
+	sink := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { forwarded.Add(1) }))
+	t.Cleanup(sink.Close)
+	redirect := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, sink.URL+"/users/count", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirect.Close)
+	connector.AdminURL = redirect.URL + "/admin/realms/lab"
+	cfg.Connectors["keycloak-lab"] = connector
+	redirectService, err := auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	require.Error(t, auth.ReconcileKeycloak(f.ctx, redirectService))
+	require.Zero(t, forwarded.Load(), "Admin redirect must not forward credentials")
+	// This second service presents an untrusted CA. No insecure TLS fallback.
+	untrusted := httptest.NewUnstartedServer(original)
+	untrusted.TLS = &tls.Config{Certificates: []tls.Certificate{privateCertificate(t)}}
+	untrusted.StartTLS()
+	t.Cleanup(untrusted.Close)
+	connector.AdminURL = untrusted.URL + "/admin/realms/lab"
+	cfg.Connectors["keycloak-lab"] = connector
+	denied, err := auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	require.Error(t, auth.ReconcileKeycloak(f.ctx, denied))
+	for _, invalid := range []string{"http://localhost/admin/realms/lab", private.URL + "/admin/realms/other", private.URL + "/admin/realms/lab?x=1", private.URL + "/admin/realms/%6cab", private.URL + "/admin/realms/lab/../lab"} {
+		connector.AdminURL = invalid
+		cfg.Connectors["keycloak-lab"] = connector
+		_, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+		require.Error(t, err)
+	}
+}
+
+func privateCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	cert := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "untrusted"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	raw, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	require.NoError(t, err)
+	return tls.Certificate{Certificate: [][]byte{raw}, PrivateKey: key}
 }

@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -57,9 +58,10 @@ func NewKeycloakService(a *Server) OIDCService {
 }
 
 type keycloakService struct {
-	a          *Server
-	lifecycle  *KeycloakLifecycleConfig
-	httpClient *http.Client
+	lifecycleMu sync.Mutex
+	a           *Server
+	lifecycle   *KeycloakLifecycleConfig
+	httpClient  *http.Client
 }
 
 // IsKeycloakUser identifies identities owned by this connector implementation.

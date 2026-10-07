@@ -61,7 +61,7 @@ class CandidateLab(LifecycleLab, KubernetesLab, Lab):
                        authenticationFlows=[{'alias':'lab-browser-mfa','providerId':'basic-flow','topLevel':True,'builtIn':False,
                                              'authenticationExecutions':[{'authenticator':'auth-username-password-form','requirement':'REQUIRED','priority':10,'authenticatorFlow':False},
                                                                          {'authenticator':'auth-otp-form','requirement':'REQUIRED','priority':20,'authenticatorFlow':False}]}])
-        fixture['clients'][0]['attributes'].update({'backchannel.logout.url':self.proxy+'/v1/webapi/oidc/logout/keycloak-lab',
+        fixture['clients'][0]['attributes'].update({'backchannel.logout.url':getattr(self,'logout_url',self.proxy+'/v1/webapi/oidc/logout/keycloak-lab'),
                                                     'backchannel.logout.session.required':'true'})
         fixture['clients'].append({'clientId':'teleport-sync','secret':self.sync_secret,'protocol':'openid-connect','publicClient':False,
                                    'standardFlowEnabled':False,'directAccessGrantsEnabled':False,'serviceAccountsEnabled':True,'fullScopeAllowed':True,'defaultClientScopes':['roles']})
@@ -98,7 +98,7 @@ class CandidateLab(LifecycleLab, KubernetesLab, Lab):
         self.run(['docker','exec',self.runner,'passwd','--delete','lab-user'])
         client=self.write('client.secret',self.client_secret); sync=self.write('sync.secret',self.sync_secret)
         lifecycle=self.write('lifecycle.json',{'ca_file':str(self.root/'ca.crt'),'poll_seconds':1,'max_stale_seconds':5,'revocation_journal_dir':str(self.root/'revocations'),
-            'connectors':{'keycloak-lab':{'issuer':self.issuer,'client_secret':{'file':str(client)},'admin_client_id':'teleport-sync','admin_client_secret':{'file':str(sync)}}}})
+            'connectors':{'keycloak-lab':{'issuer':self.issuer,'client_id':'teleport-smoke','admin_url':getattr(self,'private_admin_url',self.idp+'/admin/realms/cooplay-smoke'),'client_secret':{'file':str(client)},'admin_client_id':'teleport-sync','admin_client_secret':{'file':str(sync)}}}})
         self.env['TELEPORT_KEYCLOAK_CONFIG']=str(lifecycle)
         config={'version':'v3','teleport':{'nodename':'keycloak-smoke','data_dir':str(self.root/'data'),'pid_file':str(self.root/'data/teleport.pid'),'diag_addr':'127.0.0.1:3000','log':{'output':'stderr','severity':'INFO'}},
           'auth_service':{'enabled':True,'cluster_name':'cooplay-keycloak-smoke','listen_addr':f'127.0.0.1:{self.authport}',
@@ -140,11 +140,15 @@ class CandidateLab(LifecycleLab, KubernetesLab, Lab):
             req=urllib.request.Request(page.action,urllib.parse.urlencode(dict(page.fields,otp=bad)).encode(),headers={'Content-Type':'application/x-www-form-urlencoded'})
             with browser.open(req,timeout=30) as response: page=Page(response.read().decode()); final=response.geturl()
             self.check('incorrect_otp_denied',page.action is not None and final.startswith(self.idp+'/'))
-        if self.last_otp_period.get(username)==int(time.time())//30:
+        if self.last_otp_period.get(username)==int(time.time())//30 or time.time()%30>25:
             time.sleep(30-time.time()%30+.1)
         self.last_otp_period[username]=int(time.time())//30
         req=urllib.request.Request(page.action,urllib.parse.urlencode(dict(page.fields,otp=self.totp())).encode(),headers={'Content-Type':'application/x-www-form-urlencoded'})
-        with browser.open(req,timeout=30) as response: return Page(response.read().decode()),response.geturl()
+        with browser.open(req,timeout=30) as response:
+            body=response.read().decode()
+            self.last_login_markers=[marker for marker in ('Invalid authenticator code','Invalid username or password','Account is disabled','invalid_code','error.login') if marker.lower() in body.lower()]
+            self.last_login_path=urllib.parse.urlsplit(response.geturl()).path
+            return Page(body),response.geturl()
     def local_redirect(self,url):
         # Only the short, per-login tsh loopback handler lives in the Linux
         # namespace. Forward its GET there without exposing URL/token output.
@@ -174,7 +178,9 @@ except urllib.error.HTTPError as e:
         location=self.local_redirect(initial).get('location')
         if not location or not location.startswith(self.idp+'/'): raise Failure('unexpected tsh redirect')
         browser,_=self.browser(); page,_=self.login_form(browser,location,username)
-        if not page.redirect or not page.redirect.startswith('http://127.0.0.1:'): raise Failure('encrypted CLI callback missing')
+        if not page.redirect or not page.redirect.startswith('http://127.0.0.1:'):
+            self.result['login_failure']={'fixture':username,'form_present':page.action is not None,'markers':self.last_login_markers,'path':self.last_login_path}
+            raise Failure('encrypted CLI callback missing')
         self.local_redirect(page.redirect)
         self.check('native_tsh_login_'+username+suffix,p.wait(timeout=30)==0)
         status=json.loads(self.run([self.root/'bin/tsh','status','--format=json'],env=env).stdout)['active']
@@ -218,7 +224,7 @@ except urllib.error.HTTPError as e:
         allowed=self.run([self.root/'bin/tsh','ssh','lab-user@keycloak-smoke','id','-u'],env=active)
         self.check('unprivileged_linux_ssh',allowed.stdout.strip().isdigit() and allowed.stdout.strip()!=b'0')
         self.check('root_ssh_denied',self.run([self.root/'bin/tsh','ssh','root@keycloak-smoke','true'],env=active,check=False).returncode!=0)
-        process=self.start([self.root/'bin/tsh','ssh','-t','lab-user@keycloak-smoke','echo COOPLAY_SESSION_READY; sleep 120'],'ssh-session',active)
+        process=self.start([self.root/'bin/tsh','ssh','--no-resume','-t','lab-user@keycloak-smoke','echo COOPLAY_SESSION_READY; sleep 120'],'ssh-session',active)
         until=time.monotonic()+20
         while b'COOPLAY_SESSION_READY' not in self.outputs[process.pid]:
             if process.poll() is not None or time.monotonic()>until: raise Failure('SSH recording session did not start')

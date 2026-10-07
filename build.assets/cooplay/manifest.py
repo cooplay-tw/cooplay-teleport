@@ -38,7 +38,7 @@ for name in command("git", "ls-files", "--others", "--exclude-standard").splitli
     path = root / name
     if path.is_file():
         manifest["untracked_source_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
-for name in ("teleport", "tsh", "tctl", "cooplay-secrets", "cooplay-backup"):
+for name in ("teleport", "tsh", "tctl"):
     if not (out / name).exists():
         continue
     path = out / name

@@ -7,5 +7,6 @@
   "k3s": "rancher/k3s@sha256:ec9868c6a38d4e8c1869832fb5fd1eb8473c39794a0b44d2b952e7ba911951bc",
   "k3s_version": "v1.35.9+k3s1",
   "busybox": "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e",
-  "kube_agent_runtime": "gcr.io/distroless/base-debian13@sha256:a0d70d6a97cd697d9362bc2aae4a6560dd65817e365d0043b07325a97975dc91"
+  "kube_agent_runtime": "gcr.io/distroless/base-debian13@sha256:a0d70d6a97cd697d9362bc2aae4a6560dd65817e365d0043b07325a97975dc91",
+  "linux_amd64": "ghcr.io/gravitational/teleport-buildbox-node@sha256:3cb15437c19283f32991914be74e408d4c7e127fbc7eafb8e18bd8ff9678813d"
 }

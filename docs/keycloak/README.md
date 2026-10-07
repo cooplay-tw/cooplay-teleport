@@ -88,30 +88,45 @@ An Auth-local example (unusable addresses and no company values):
   "connectors": {
     "keycloak-lab": {
       "issuer": "https://idp.example.invalid/realms/lab",
-      "client_secret": {"file": "/run/secrets/oidc-client"},
+      "client_id": "teleport-lab",
+      "admin_url": "https://idp-admin.example.invalid:8444/admin/realms/lab",
+      "client_secret": {"file": "/var/lib/teleport-secrets/current/oidc-client"},
       "admin_client_id": "teleport-sync",
-      "admin_client_secret": {"file": "/run/secrets/sync-client"}
+      "admin_client_secret": {"file": "/var/lib/teleport-secrets/current/sync-client"}
     }
   }
 }
 ```
 
 An optional `ca_file` adds an explicitly trusted CA without disabling verification.
-Each secret reference is either an absolute private regular file or an AWS
-Secrets Manager ARN plus explicit `region` and optional `json_key`. The AWS SDK
-uses its normal workload identity chain and reads `AWSCURRENT`; no secret values
-are stored in connector resources. Put a non-secret sentinel in the native
-connector's required `client_secret` field. Read errors are redacted and deny
-access. References are read on use, so rotation needs no Auth restart. File
-rotation should atomically replace a mode-0600 file. Configuration/CA changes
-require a controlled restart.
+`admin_url` is an explicit Auth-local HTTPS URL ending in the same issuer realm's
+`/admin/realms/<realm>` path (and context prefix, if present). It may use a private
+origin. Only fixed read-only user/count/group/session paths receive the service
+bearer there. User info, query strings, fragments, encoded paths, other realms and
+redirects are rejected. Public OIDC discovery/token/JWKS origin restrictions are
+unchanged. Network/proxy policy must independently prevent public Admin access;
+Keycloak's admin hostname setting alone does not enforce that restriction.
 
-`cooplay-secrets` materializes a manifest of references into a new private
-versioned directory, publishing only after every read succeeds. Its explicit
-`multiline` option is for TLS/JSON files; OIDC client secret references reject it.
-The private repo supplies IAM templates, Keycloak/PG ownership preparation and
-service reload procedures. A real AWS call needs formal execution identity and
-ARNs; SDK behavior is tested with a bounded fake endpoint, not a production account.
+`client_id` must match the native connector. User sessions must contain both the
+validated ID-token `sid` and this client ID in the Admin API's client map. Missing
+sessions revoke only the affected login generation. An unavailable, oversized or
+malformed response fails synchronization; it is never interpreted as logout.
+The startup health probe uses `GET /users/count`, including when no logins exist.
+These operations use the existing `view-users` service account role.
+
+Secret references contain an absolute private regular `file` and optional
+`json_key`; OIDC secrets must be single-line. Cloud-provider fields are rejected
+by the managed configuration loader. Put a non-secret sentinel in the native
+connector's required `client_secret` field. Errors are redacted. Files are reopened
+on use, so rotation needs no Auth restart. Use atomic file replacement or a
+private parent-owned generation link; never overwrite a live file partially.
+Configuration/CA changes require a controlled restart.
+
+Provisioning, provider SDKs, IAM, rotation orchestration and backup utilities belong
+to the deployment repository. This connector needs no AWS credentials, Secrets
+Manager, metadata service or provider process. A home deployment must persist its
+local secret generation independently of this Auth's availability and `/run`.
+Cloud secret refresh failure is distinct from an unavailable authoritative IdP.
 
 ## Logout, deactivation, and already issued credentials
 
@@ -119,9 +134,11 @@ ARNs; SDK behavior is tested with a bounded fake endpoint, not a production acco
 | --- | --- |
 | Web or `tsh logout` | Revoke the current login marker server-side before local cleanup. A copied session/certificate and its active connections are denied by native locks; another independent login remains valid. If remote revocation cannot be confirmed, cleanup still runs and the caller receives an error. |
 | Keycloak back-channel logout | Verify a signed logout JWT, exact event, issuer/audience, recent issue time, no nonce, subject/session and replay identity. Lock all matching existing login generations; fresh authentication is allowed. Identical retries finish idempotently; a changed payload reusing a `jti` fails. |
+| Missed Keycloak logout notification | Read-only session reconciliation detects the missing session or client binding and durably revokes matching login markers. Another active session and future authentication remain usable. |
 | Group removed | Reconciliation locks affected old login markers. Fresh login may obtain remaining/current mappings. Re-adding a group never unlocks an old marker. |
 | Account disabled/deleted | Persist a non-expiring user revocation and native user lock, including after temporary user resources expire. Re-enabling the same IdP subject does **not** reinstate it. |
-| Sync unavailable | New login requires a fresh live check. After configured staleness, a connector marker lock denies existing credentials and closes monitored connections. Successful reconciliation removes only the health lock, never individual revocations. |
+| Auth restart / restore | Replay retained journal and synchronously create connector guard locks; discard previous health timestamps before serving. Only fresh private Admin probing and account/session reconciliation remove the guards. Native lock propagation to already-running remote agents remains bounded separately. |
+| Sync unavailable | New login requires a fresh live check. After configured staleness, a connector marker lock denies existing credentials and closes monitored connections. Recovery verifies client sessions before removing the health lock, never individual revocations. |
 | Certificate expiry | Native strict monitors close SSH/Kubernetes connections; old credentials cannot authenticate or extend their original lifetime. |
 
 The candidate intentionally treats account suspension as permanent for that
@@ -133,11 +150,12 @@ operational constraint, not automatic reactivation.
 
 Local logout does not redirect the browser through Keycloak RP-initiated logout;
 that would also terminate its IdP session. Use Keycloak's session/account logout
-for that scope, which delivers the validated back-channel notification. The
+for that scope, which delivers the validated back-channel notification. Session polling
+provides bounded recovery when the notification path fails. The
 [OIDC back-channel specification](https://openid.net/specs/openid-connect-backchannel-1_0.html)
 is the notification contract.
 
-Reconciliation uses only Keycloak `view-users`: no realm-admin, writes or client
+Reconciliation uses only Keycloak `view-users` (including online sessions): no realm-admin, writes or client
 administration. Passes are bounded, retry with jitter, deduplicate subjects, page
 groups completely, and fail closed on partial reads. Metrics expose successful
 sync time, allowed staleness and failures; native high-severity cluster alerts
@@ -190,10 +208,11 @@ python3 build.assets/cooplay/baseline-build.py
 python3 build.assets/cooplay/real-keycloak-smoke.py
 ```
 
-`full-build.sh` builds normal embedded UI and `teleport`, `tsh`, `tctl`,
-`cooplay-secrets`, `cooplay-backup` for native macOS ARM64 and pinned Linux ARM64.
-Linux includes the upstream embedded session helper. The `ui`, `native` and
-`linux` targets may be invoked separately. Each output directory has a manifest
+`full-build.sh` builds normal embedded UI and `teleport`, `tsh`, `tctl`
+for native macOS ARM64 and pinned Linux ARM64 / AMD64. Deployment helpers
+are built and versioned independently in the private platform repository.
+Linux includes the upstream embedded session helper. The `ui`, `native`, `linux` (ARM64) and
+`linux-amd64` targets may be invoked separately. Each output directory has a manifest
 with exact fork revision, dirty status, compiler, lock/asset hashes and every
 artifact digest. The older `keycloak.sh build` profile is only a CLI development
 build and must not be selected for deployment.
