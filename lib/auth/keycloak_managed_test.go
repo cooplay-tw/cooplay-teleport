@@ -34,7 +34,7 @@ import (
 
 type keycloakAdminFixture struct{ disabled, removed, unavailable, ended, brokenSessions atomic.Bool }
 
-func managedKeycloakFixture(t *testing.T) (*keycloakFixture, *keycloakAdminFixture, auth.KeycloakLifecycleConfig) {
+func managedKeycloakFixture(t *testing.T, sessionSeconds ...int) (*keycloakFixture, *keycloakAdminFixture, auth.KeycloakLifecycleConfig) {
 	t.Helper()
 	f := newKeycloakFixture(t)
 	admin := &keycloakAdminFixture{}
@@ -91,6 +91,13 @@ func managedKeycloakFixture(t *testing.T) (*keycloakFixture, *keycloakAdminFixtu
 	require.NoError(t, os.WriteFile(secret, []byte(keycloakTestSecret), 0600))
 	require.NoError(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.idp.Certificate().Raw}), 0600))
 	cfg := auth.KeycloakLifecycleConfig{CAFile: ca, RevocationJournalDir: filepath.Join(dir, "journal"), PollSeconds: 1, MaxStaleSeconds: 2, Connectors: map[string]auth.KeycloakLifecycleConnector{"keycloak-lab": {Issuer: f.idp.URL + "/realms/lab", ClientID: "teleport-lab", AdminURL: f.idp.URL + "/admin/realms/lab", ClientSecret: secrets.Reference{File: secret}, AdminClientID: "sync-lab", AdminClientSecret: secrets.Reference{File: secret}}}}
+	if len(sessionSeconds) != 0 {
+		cfg.MaxSessionSeconds = sessionSeconds[0]
+		role := keycloakLabRole(t).(*types.RoleV6)
+		role.Spec.Options.MaxSessionTTL = types.Duration(time.Duration(sessionSeconds[0]) * time.Second)
+		_, err := f.a.AuthServer.UpsertRole(f.ctx, role)
+		require.NoError(t, err)
+	}
 	var err error
 	f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
 	require.NoError(t, err)
@@ -435,4 +442,127 @@ func privateCertificate(t *testing.T) tls.Certificate {
 	raw, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
 	require.NoError(t, err)
 	return tls.Certificate{Certificate: [][]byte{raw}, PrivateKey: key}
+}
+
+// A short-lived ID token is consumed at authentication. Explicit managed
+// sessions remain bounded and revocable after that token has expired.
+func TestKeycloakManagedDailySession(t *testing.T) {
+	for _, reason := range []string{"missed logout", "disabled", "outage", "backchannel", "group removed"} {
+		t.Run(reason, func(t *testing.T) {
+			f, admin, cfg := managedKeycloakFixture(t, 86400)
+			f.requestedTTL = 24 * time.Hour
+			first, roles := managedLogin(t, f, "sid-a")
+			expires := first.Session.GetExpiryTime()
+			require.WithinDuration(t, f.clock.Now().Add(24*time.Hour), expires, 5*time.Second)
+			var marker, guard string
+			for _, name := range roles {
+				role, err := f.a.AuthServer.GetRole(f.ctx, name)
+				require.NoError(t, err)
+				require.Equal(t, 24*time.Hour, role.GetOptions().MaxSessionTTL.Duration())
+				if strings.HasPrefix(name, "keycloak-login-") {
+					marker = name
+				}
+				if strings.HasPrefix(name, "keycloak-guard-") {
+					guard = name
+				}
+			}
+			f.clock.Advance(6 * time.Minute)
+			require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+			locks, err := f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: marker}, types.LockTarget{Role: guard})
+			require.NoError(t, err)
+			require.Empty(t, locks, "original token expiry is not IdP logout")
+			target := types.LockTarget{Role: marker}
+			switch reason {
+			case "missed logout":
+				admin.ended.Store(true)
+			case "disabled":
+				admin.disabled.Store(true)
+				target = types.LockTarget{User: first.Username}
+			case "group removed":
+				admin.removed.Store(true)
+			case "outage":
+				admin.unavailable.Store(true)
+				f.clock.Advance(3 * time.Second)
+				target = types.LockTarget{Role: guard}
+			case "backchannel":
+				srv := managedTLS(t, f)
+				proxy, err := srv.NewClient(authtest.TestBuiltin(types.RoleProxy))
+				require.NoError(t, err)
+				defer proxy.Close()
+				raw, err := signKeycloakToken(map[string]any{"iss": f.idp.URL + "/realms/lab", "aud": "teleport-lab", "iat": f.clock.Now().Unix(), "jti": "daily-logout", "sid": "sid-a", "sub": "immutable-subject", "events": map[string]any{"http://schemas.openid.net/event/backchannel-logout": map[string]any{}}}, f.key)
+				require.NoError(t, err)
+				require.NoError(t, proxy.KeycloakLogout(f.ctx, authclient.KeycloakLogoutRequest{ConnectorID: "keycloak-lab", LogoutToken: raw}))
+			}
+			err = auth.ReconcileKeycloak(f.ctx, f.svc)
+			if reason == "outage" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			locks, err = f.a.AuthServer.GetLocks(f.ctx, false, target)
+			require.NoError(t, err)
+			require.Len(t, locks, 1)
+			require.True(t, f.clock.Now().Before(expires), "lock must precede session expiry")
+			// Restart replays durable intent; restoring IdP availability/status
+			// must never resurrect an ended login or permanently disabled user.
+			f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+			require.NoError(t, err)
+			f.a.AuthServer.SetOIDCService(f.svc)
+			admin.unavailable.Store(false)
+			admin.disabled.Store(false)
+			admin.removed.Store(false)
+			require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+			locks, err = f.a.AuthServer.GetLocks(f.ctx, false, target)
+			require.NoError(t, err)
+			if reason == "outage" {
+				require.Empty(t, locks)
+			} else {
+				require.Len(t, locks, 1)
+			}
+		})
+	}
+}
+
+func TestKeycloakManagedDailySessionRejectsStaleIdentity(t *testing.T) {
+	f, _, _ := managedKeycloakFixture(t, 86400)
+	for _, remaining := range []time.Duration{-time.Minute, 30 * time.Second} {
+		_, q := f.begin(t, true, func(c map[string]any) { c["sid"] = "sid-a"; c["exp"] = f.clock.Now().Add(remaining).Unix() })
+		_, err := f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+		require.Error(t, err)
+	}
+	for _, seconds := range []int{-1, 299, 86401} {
+		_, err := auth.NewManagedKeycloakService(f.a.AuthServer, auth.KeycloakLifecycleConfig{MaxSessionSeconds: seconds})
+		require.ErrorContains(t, err, "max_session_seconds")
+	}
+	for _, requested := range []time.Duration{0, 48 * time.Hour} {
+		req := f.request(true)
+		req.CertTTL = requested
+		actual, err := f.svc.CreateOIDCAuthRequest(f.ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, 24*time.Hour, actual.CertTTL)
+	}
+}
+
+func TestKeycloakManagedDailySessionMigratesOnlyMarkerTTL(t *testing.T) {
+	f, _, cfg := managedKeycloakFixture(t)
+	_, oldRoles := managedLogin(t, f, "sid-a")
+	cfg.MaxSessionSeconds = 86400
+	role := keycloakLabRole(t).(*types.RoleV6)
+	role.Spec.Options.MaxSessionTTL = types.Duration(24 * time.Hour)
+	_, err := f.a.AuthServer.UpsertRole(f.ctx, role)
+	require.NoError(t, err)
+	f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	f.a.AuthServer.SetOIDCService(f.svc)
+	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	login, _ := managedLogin(t, f, "sid-b")
+	require.WithinDuration(t, f.clock.Now().Add(time.Hour), login.Session.GetExpiryTime(), 5*time.Second)
+	for _, name := range oldRoles {
+		if !strings.HasPrefix(name, "keycloak-login-") {
+			continue
+		}
+		old, err := f.a.AuthServer.GetRole(f.ctx, name)
+		require.NoError(t, err)
+		require.Equal(t, 5*time.Minute, old.GetOptions().MaxSessionTTL.Duration(), "old login is not extended")
+	}
 }

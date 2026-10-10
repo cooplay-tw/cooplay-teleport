@@ -41,6 +41,7 @@ type KeycloakLifecycleConfig struct {
 	RevocationJournalDir string                                `json:"revocation_journal_dir"`
 	CAFile               string                                `json:"ca_file,omitempty"`
 	PollSeconds          int                                   `json:"poll_seconds"`
+	MaxSessionSeconds    int                                   `json:"max_session_seconds,omitempty"`
 	MaxStaleSeconds      int                                   `json:"max_stale_seconds"`
 	Connectors           map[string]KeycloakLifecycleConnector `json:"connectors"`
 }
@@ -86,6 +87,9 @@ func keycloakGuard(connector string) string { return keycloakGuardPrefix + keycl
 // NewKeycloakService constructor remains useful for protocol unit tests only;
 // the process startup always uses this constructor when SSO is enabled.
 func NewManagedKeycloakService(a *Server, cfg KeycloakLifecycleConfig) (OIDCService, error) {
+	if cfg.MaxSessionSeconds != 0 && (cfg.MaxSessionSeconds < int(keycloakSessionTTL/time.Second) || cfg.MaxSessionSeconds > int(keycloakMaxSessionTTL/time.Second)) {
+		return nil, trace.BadParameter("Keycloak max_session_seconds must be omitted or between 300 and 86400")
+	}
 	if cfg.PollSeconds < 1 || cfg.PollSeconds > 30 || cfg.MaxStaleSeconds < cfg.PollSeconds*2 || cfg.MaxStaleSeconds > 120 || len(cfg.Connectors) == 0 {
 		return nil, trace.BadParameter("Keycloak requires a 1..30s poll interval, 2 intervals..120s staleness, and connectors")
 	}
@@ -221,7 +225,7 @@ func (s *keycloakService) revoked(ctx context.Context, kind, id string) error {
 }
 
 func (s *keycloakService) markerRole(ctx context.Context, name string, expires time.Time) error {
-	role := &types.RoleV6{Kind: types.KindRole, Version: types.V8, Metadata: types.Metadata{Name: name, Labels: map[string]string{keycloakUserLabel: "marker"}}, Spec: types.RoleSpecV6{Options: types.RoleOptions{MaxSessionTTL: types.Duration(keycloakSessionTTL), DisconnectExpiredCert: true, Lock: constants.LockingModeStrict}}}
+	role := &types.RoleV6{Kind: types.KindRole, Version: types.V8, Metadata: types.Metadata{Name: name, Labels: map[string]string{keycloakUserLabel: "marker"}}, Spec: types.RoleSpecV6{Options: types.RoleOptions{MaxSessionTTL: types.Duration(s.sessionTTL()), DisconnectExpiredCert: true, Lock: constants.LockingModeStrict}}}
 	if !expires.IsZero() {
 		role.SetExpiry(expires.Add(time.Hour))
 	}
@@ -242,8 +246,19 @@ func (s *keycloakService) markerRole(ctx context.Context, name string, expires t
 	existing, err := s.a.Services.GetRole(ctx, name)
 	if err == nil {
 		concrete, ok := existing.(*types.RoleV6)
-		if !ok || concrete.Metadata.Labels[keycloakUserLabel] != "marker" || !keycloakRoleSpecEqual(concrete.Spec, role.Spec) {
+		if !ok || concrete.Metadata.Labels[keycloakUserLabel] != "marker" {
 			return trace.AccessDenied("Keycloak marker role collision")
+		}
+		// A reviewed Auth-local TTL change may update only this zero-grant
+		// marker's cap. All other options/grants must still match exactly.
+		previousTTL := concrete.Spec.Options.MaxSessionTTL
+		concrete.Spec.Options.MaxSessionTTL = role.Spec.Options.MaxSessionTTL
+		if !keycloakRoleSpecEqual(concrete.Spec, role.Spec) {
+			return trace.AccessDenied("Keycloak marker role collision")
+		}
+		if previousTTL != role.Spec.Options.MaxSessionTTL {
+			_, err = s.a.Services.UpsertRole(ctx, concrete)
+			return trace.Wrap(err)
 		}
 		return nil
 	}

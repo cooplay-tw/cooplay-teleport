@@ -40,10 +40,11 @@ import (
 )
 
 const (
-	keycloakSessionTTL = 5 * time.Minute
-	keycloakRequestTTL = 3 * time.Minute
-	keycloakUserPrefix = "keycloak-"
-	keycloakUserLabel  = "cooplay.dev/keycloak"
+	keycloakSessionTTL    = 5 * time.Minute
+	keycloakMaxSessionTTL = 24 * time.Hour
+	keycloakRequestTTL    = 3 * time.Minute
+	keycloakUserPrefix    = "keycloak-"
+	keycloakUserLabel     = "cooplay.dev/keycloak"
 )
 
 var keycloakNamespaceName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -62,6 +63,15 @@ type keycloakService struct {
 	a           *Server
 	lifecycle   *KeycloakLifecycleConfig
 	httpClient  *http.Client
+}
+
+// sessionTTL is an Auth-local cap. Longer sessions require the managed
+// lifecycle service; the protocol-only constructor retains the short default.
+func (s *keycloakService) sessionTTL() time.Duration {
+	if s.lifecycle != nil && s.lifecycle.MaxSessionSeconds > 0 {
+		return time.Duration(s.lifecycle.MaxSessionSeconds) * time.Second
+	}
+	return keycloakSessionTTL
 }
 
 // IsKeycloakUser identifies identities owned by this connector implementation.
@@ -215,8 +225,8 @@ func (s *keycloakService) CreateOIDCAuthRequest(ctx context.Context, req types.O
 	if req.CertTTL < 0 {
 		return nil, trace.BadParameter("invalid certificate TTL")
 	}
-	if req.CertTTL == 0 || req.CertTTL > keycloakSessionTTL {
-		req.CertTTL = keycloakSessionTTL
+	if req.CertTTL == 0 || req.CertTTL > s.sessionTTL() {
+		req.CertTTL = s.sessionTTL()
 	}
 	c, err := s.connector(ctx, req.ConnectorID)
 	if err != nil {
@@ -426,13 +436,23 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 	event.UserRoles = roles
 	// Keep an absolute deadline across slow backend/signing operations.
 	now := s.a.clock.Now()
-	ttl := min(keycloakSessionTTL, stored.Request.CertTTL, id.Expiry.Sub(now))
+	// The ID token authenticates this exchange and must still have sufficient
+	// validity here. An explicitly configured managed session has its own
+	// absolute deadline, continuously checked against authoritative IdP state.
+	// Do not retain/refresh the ID token or extend the IdP token lifetime.
+	if id.Expiry.Sub(now) < apidefaults.MinCertDuration {
+		return nil, trace.AccessDenied("Keycloak identity expires too soon")
+	}
+	ttl := min(s.sessionTTL(), stored.Request.CertTTL)
+	if s.sessionTTL() <= keycloakSessionTTL {
+		ttl = min(ttl, id.Expiry.Sub(now))
+	}
 	for _, name := range roles {
 		role, err := s.a.Services.GetRole(ctx, name)
 		if err != nil {
 			return nil, trace.AccessDenied("mapped Keycloak role unavailable")
 		}
-		if err := validateKeycloakRole(role); err != nil {
+		if err := validateKeycloakRoleWithTTL(role, s.sessionTTL()); err != nil {
 			return nil, err
 		}
 		ttl = min(ttl, role.GetOptions().MaxSessionTTL.Duration())
@@ -470,9 +490,13 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 }
 
 func validateKeycloakRole(role types.Role) error {
+	return validateKeycloakRoleWithTTL(role, keycloakSessionTTL)
+}
+
+func validateKeycloakRoleWithTTL(role types.Role, maxTTL time.Duration) error {
 	o := role.GetOptions()
-	if o.MaxSessionTTL.Duration() <= 0 || o.MaxSessionTTL.Duration() > keycloakSessionTTL || !o.DisconnectExpiredCert || o.Lock != constants.LockingModeStrict {
-		return trace.AccessDenied("Keycloak roles require max_session_ttl <= 5m, disconnect_expired_cert and strict locking")
+	if o.MaxSessionTTL.Duration() <= 0 || o.MaxSessionTTL.Duration() > maxTTL || !o.DisconnectExpiredCert || o.Lock != constants.LockingModeStrict {
+		return trace.AccessDenied("Keycloak roles require max_session_ttl <= %s, disconnect_expired_cert and strict locking", maxTTL)
 	}
 	concrete, ok := role.(*types.RoleV6)
 	if !ok || role.GetVersion() != types.V8 {

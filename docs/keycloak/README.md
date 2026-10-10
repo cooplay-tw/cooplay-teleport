@@ -57,17 +57,20 @@ accept only authenticated native Proxy identities.
   regexes/globs/templates, role impersonation and access-request augmentation fail.
   The Admin API rechecks enabled status and groups at every login.
 - Supported resource grants are SSH and Kubernetes. Role v8, strict locking,
-  disconnect on expiry and at most five-minute TTL are mandatory. SSH grants
+  disconnect on expiry and an explicit bounded TTL are mandatory (five minutes by default; managed deployments may opt into at most 24 hours). SSH grants
   require explicit unprivileged logins and labels; forwarding/file copy are off.
   Kubernetes grants require explicit labels, users/groups, namespaces and verbs;
   exec requires an exact pod name. App/DB/desktop/cloud/admin grants are rejected.
   See [SSH example](../../examples/keycloak/role.yaml) and
   [Kubernetes example](../../examples/keycloak/kubernetes-role.yaml).
 - Teleport signs the normal SSH/TLS credentials. Lifetime is the minimum of
-  requested TTL, role TTL, five minutes and ID-token remaining lifetime. Native
-  reissue and web renewal preserve the original deadline and role generation.
-  Insufficient remaining time for native minimum issuance fails closed; use
-  requests of 2–5 minutes. No refresh/offline tokens are retained.
+  requested TTL, role TTL and the Auth-local session cap. The default also caps
+  the session at the ID-token remaining lifetime. With an explicit managed cap
+  above five minutes, a freshly validated ID token authenticates the exchange;
+  its later expiry is independent of the bounded Teleport session. Expired or
+  insufficiently valid ID tokens still fail login. Native reissue and web renewal
+  preserve the original deadline and role generation. No refresh/offline tokens
+  are retained; IdP online sessions continue to govern revocation.
 - Every login carries two extra **zero-grant** roles: a unique login marker and
   a connector health marker. Native locks target these markers without adding
   resource privileges. The stored user's roles remain the actual mapped roles.
@@ -97,6 +100,24 @@ An Auth-local example (unusable addresses and no company values):
   }
 }
 ```
+
+Optional `max_session_seconds` is omitted by default (300 seconds), or must be
+between 300 and 86400. Values above 300 are available only through the managed
+lifecycle constructor and require continuously authoritative account, membership
+and client-session checks. A longer role alone cannot override the Auth cap.
+An unchanged default deployment keeps its five-minute behavior. Existing login
+records and certificates are never extended by a configuration change. Zero-grant
+connector marker caps can migrate only if all other marker fields match exactly.
+Changing the cap requires an Auth restart; do not downgrade to a previous binary
+that rejects this field until the old settings and bounded-session contract have
+been restored. Outstanding longer credentials must remain fenced by locks and
+their original deadlines; do not erase journals to roll back.
+
+IdP SSO/client session idle and maximum durations are independent upper bounds:
+if Keycloak expires the online client session, reconciliation revokes Teleport
+even before this cap. This setting does not refresh or prolong a Keycloak session.
+Set deployment-specific SSH idle time separately; no company defaults are baked
+into this public fork.
 
 An optional `ca_file` adds an explicitly trusted CA without disabling verification.
 `admin_url` is an explicit Auth-local HTTPS URL ending in the same issuer realm's
@@ -165,8 +186,8 @@ New login rejects a stale health timestamp immediately. Existing-connection
 fencing runs at reconciliation boundaries: an in-flight pass can consume up to
 `max_stale_seconds`, followed by up to 1.2 poll intervals and native lock
 propagation. Size the formal revocation SLO for that conservative bound, not
-just the configured poll interval; credentials independently expire within five
-minutes. The local outage measurement is evidence for that fixture, not a
+just the configured poll interval; credentials independently expire within the configured session cap
+(five minutes by default). The local outage measurement is evidence for that fixture, not a
 production latency guarantee. Native tsh may retry a disconnected session;
 the outage/expiry probes use `--no-resume` to measure actual termination.
 

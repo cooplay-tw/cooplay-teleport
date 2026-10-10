@@ -99,3 +99,18 @@ func TestKeycloakKubernetesRole(t *testing.T) {
 		require.Error(t, validateKeycloakRole(fresh))
 	}
 }
+
+func TestKeycloakDailyRoleCapPreservesRestrictions(t *testing.T) {
+	role := keycloakSSHRoleForValidation()
+	role.Spec.Options.MaxSessionTTL = types.Duration(24 * time.Hour)
+	require.Error(t, validateKeycloakRole(role))
+	require.NoError(t, validateKeycloakRoleWithTTL(role, 24*time.Hour))
+	role.Spec.Options.DisconnectExpiredCert = false
+	require.Error(t, validateKeycloakRoleWithTTL(role, 24*time.Hour))
+	role.Spec.Options.DisconnectExpiredCert = true
+	role.Spec.Options.Lock = "best_effort"
+	require.Error(t, validateKeycloakRoleWithTTL(role, 24*time.Hour))
+	role.Spec.Options.Lock = "strict"
+	role.Spec.Options.MaxSessionTTL = types.Duration(24*time.Hour + time.Second)
+	require.Error(t, validateKeycloakRoleWithTTL(role, 24*time.Hour))
+}

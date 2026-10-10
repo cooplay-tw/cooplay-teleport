@@ -53,6 +53,7 @@ type keycloakCode struct {
 }
 
 type keycloakFixture struct {
+	requestedTTL time.Duration
 	ctx          context.Context
 	clock        *clockwork.FakeClock
 	a            *authtest.AuthServer
@@ -191,7 +192,11 @@ func signKeycloakToken(claims map[string]any, key *rsa.PrivateKey) (string, erro
 }
 
 func (f *keycloakFixture) request(web bool) types.OIDCAuthRequest {
-	req := types.OIDCAuthRequest{ConnectorID: f.connector.GetName(), CheckUser: true, CertTTL: time.Hour, ClientLoginIP: "127.0.0.1"}
+	ttl := f.requestedTTL
+	if ttl == 0 {
+		ttl = time.Hour
+	}
+	req := types.OIDCAuthRequest{ConnectorID: f.connector.GetName(), CheckUser: true, CertTTL: ttl, ClientLoginIP: "127.0.0.1"}
 	if web {
 		req.CreateWebSession, req.CSRFToken, req.ClientRedirectURL = true, "fixture-csrf", "https://proxy.example.test/web"
 	} else {
