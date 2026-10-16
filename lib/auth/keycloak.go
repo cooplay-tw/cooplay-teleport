@@ -41,7 +41,7 @@ import (
 
 const (
 	keycloakSessionTTL    = 5 * time.Minute
-	keycloakMaxSessionTTL = 24 * time.Hour
+	keycloakMaxSessionTTL = 30 * 24 * time.Hour
 	keycloakRequestTTL    = 3 * time.Minute
 	keycloakUserPrefix    = "keycloak-"
 	keycloakUserLabel     = "cooplay.dev/keycloak"
@@ -242,7 +242,14 @@ func (s *keycloakService) CreateOIDCAuthRequest(ctx context.Context, req types.O
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := req.Check(); err != nil {
+	// The native OIDC record exists only for proxy failure redirects and has
+	// an upstream 30-hour certificate validation ceiling. Keep that public
+	// record within its native bound; only the private, single-use Keycloak
+	// request below carries the managed TTL, already capped by Auth above.
+	// This does not relax validation for any other OIDC provider.
+	nativeRequest := req
+	nativeRequest.CertTTL = min(req.CertTTL, apidefaults.MaxCertDuration)
+	if err := nativeRequest.Check(); err != nil {
 		return nil, trace.BadParameter("invalid Keycloak login request")
 	}
 	nonce, err := utils.CryptoRandomHex(32)
@@ -263,7 +270,9 @@ func (s *keycloakService) CreateOIDCAuthRequest(ctx context.Context, req types.O
 	}
 	// Native storage holds only the public request fields for proxy failure
 	// redirects. Never expose the PKCE verifier via GetOIDCAuthRequest.
-	if err := s.a.Services.CreateOIDCAuthRequest(ctx, req, keycloakRequestTTL); err != nil {
+	nativeRequest.RedirectURL = req.RedirectURL
+	nativeRequest.LoginHint = req.LoginHint
+	if err := s.a.Services.CreateOIDCAuthRequest(ctx, nativeRequest, keycloakRequestTTL); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if _, err := s.a.bk.Create(ctx, backend.Item{Key: keycloakStateKey(req.StateToken), Value: data, Expires: stored.Expires}); err != nil {

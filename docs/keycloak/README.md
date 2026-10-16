@@ -57,7 +57,7 @@ accept only authenticated native Proxy identities.
   regexes/globs/templates, role impersonation and access-request augmentation fail.
   The Admin API rechecks enabled status and groups at every login.
 - Supported resource grants are SSH and Kubernetes. Role v8, strict locking,
-  disconnect on expiry and an explicit bounded TTL are mandatory (five minutes by default; managed deployments may opt into at most 24 hours). SSH grants
+  disconnect on expiry and an explicit bounded TTL are mandatory (five minutes by default; managed deployments may opt into at most 30 days). SSH grants
   require explicit unprivileged logins and labels; forwarding/file copy are off.
   Kubernetes grants require explicit labels, users/groups, namespaces and verbs;
   exec requires an exact pod name. App/DB/desktop/cloud/admin grants are rejected.
@@ -102,7 +102,7 @@ An Auth-local example (unusable addresses and no company values):
 ```
 
 Optional `max_session_seconds` is omitted by default (300 seconds), or must be
-between 300 and 86400. Values above 300 are available only through the managed
+between 300 and 2592000. Values above 300 are available only through the managed
 lifecycle constructor and require continuously authoritative account, membership
 and client-session checks. A longer role alone cannot override the Auth cap.
 An unchanged default deployment keeps its five-minute behavior. Existing login

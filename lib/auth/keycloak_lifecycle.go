@@ -88,7 +88,7 @@ func keycloakGuard(connector string) string { return keycloakGuardPrefix + keycl
 // the process startup always uses this constructor when SSO is enabled.
 func NewManagedKeycloakService(a *Server, cfg KeycloakLifecycleConfig) (OIDCService, error) {
 	if cfg.MaxSessionSeconds != 0 && (cfg.MaxSessionSeconds < int(keycloakSessionTTL/time.Second) || cfg.MaxSessionSeconds > int(keycloakMaxSessionTTL/time.Second)) {
-		return nil, trace.BadParameter("Keycloak max_session_seconds must be omitted or between 300 and 86400")
+		return nil, trace.BadParameter("Keycloak max_session_seconds must be omitted or between 300 and 2592000")
 	}
 	if cfg.PollSeconds < 1 || cfg.PollSeconds > 30 || cfg.MaxStaleSeconds < cfg.PollSeconds*2 || cfg.MaxStaleSeconds > 120 || len(cfg.Connectors) == 0 {
 		return nil, trace.BadParameter("Keycloak requires a 1..30s poll interval, 2 intervals..120s staleness, and connectors")

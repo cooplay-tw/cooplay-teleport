@@ -446,78 +446,82 @@ func privateCertificate(t *testing.T) tls.Certificate {
 
 // A short-lived ID token is consumed at authentication. Explicit managed
 // sessions remain bounded and revocable after that token has expired.
-func TestKeycloakManagedDailySession(t *testing.T) {
-	for _, reason := range []string{"missed logout", "disabled", "outage", "backchannel", "group removed"} {
-		t.Run(reason, func(t *testing.T) {
-			f, admin, cfg := managedKeycloakFixture(t, 86400)
-			f.requestedTTL = 24 * time.Hour
-			first, roles := managedLogin(t, f, "sid-a")
-			expires := first.Session.GetExpiryTime()
-			require.WithinDuration(t, f.clock.Now().Add(24*time.Hour), expires, 5*time.Second)
-			var marker, guard string
-			for _, name := range roles {
-				role, err := f.a.AuthServer.GetRole(f.ctx, name)
-				require.NoError(t, err)
-				require.Equal(t, 24*time.Hour, role.GetOptions().MaxSessionTTL.Duration())
-				if strings.HasPrefix(name, "keycloak-login-") {
-					marker = name
-				}
-				if strings.HasPrefix(name, "keycloak-guard-") {
-					guard = name
-				}
-			}
-			f.clock.Advance(6 * time.Minute)
-			require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
-			locks, err := f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: marker}, types.LockTarget{Role: guard})
-			require.NoError(t, err)
-			require.Empty(t, locks, "original token expiry is not IdP logout")
-			target := types.LockTarget{Role: marker}
-			switch reason {
-			case "missed logout":
-				admin.ended.Store(true)
-			case "disabled":
-				admin.disabled.Store(true)
-				target = types.LockTarget{User: first.Username}
-			case "group removed":
-				admin.removed.Store(true)
-			case "outage":
-				admin.unavailable.Store(true)
-				f.clock.Advance(3 * time.Second)
-				target = types.LockTarget{Role: guard}
-			case "backchannel":
-				srv := managedTLS(t, f)
-				proxy, err := srv.NewClient(authtest.TestBuiltin(types.RoleProxy))
-				require.NoError(t, err)
-				defer proxy.Close()
-				raw, err := signKeycloakToken(map[string]any{"iss": f.idp.URL + "/realms/lab", "aud": "teleport-lab", "iat": f.clock.Now().Unix(), "jti": "daily-logout", "sid": "sid-a", "sub": "immutable-subject", "events": map[string]any{"http://schemas.openid.net/event/backchannel-logout": map[string]any{}}}, f.key)
-				require.NoError(t, err)
-				require.NoError(t, proxy.KeycloakLogout(f.ctx, authclient.KeycloakLogoutRequest{ConnectorID: "keycloak-lab", LogoutToken: raw}))
-			}
-			err = auth.ReconcileKeycloak(f.ctx, f.svc)
-			if reason == "outage" {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-			locks, err = f.a.AuthServer.GetLocks(f.ctx, false, target)
-			require.NoError(t, err)
-			require.Len(t, locks, 1)
-			require.True(t, f.clock.Now().Before(expires), "lock must precede session expiry")
-			// Restart replays durable intent; restoring IdP availability/status
-			// must never resurrect an ended login or permanently disabled user.
-			f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
-			require.NoError(t, err)
-			f.a.AuthServer.SetOIDCService(f.svc)
-			admin.unavailable.Store(false)
-			admin.disabled.Store(false)
-			admin.removed.Store(false)
-			require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
-			locks, err = f.a.AuthServer.GetLocks(f.ctx, false, target)
-			require.NoError(t, err)
-			if reason == "outage" {
-				require.Empty(t, locks)
-			} else {
-				require.Len(t, locks, 1)
+func TestKeycloakManagedLongSession(t *testing.T) {
+	for _, sessionTTL := range []time.Duration{24 * time.Hour, 30 * 24 * time.Hour} {
+		t.Run(sessionTTL.String(), func(t *testing.T) {
+			for _, reason := range []string{"missed logout", "disabled", "outage", "backchannel", "group removed"} {
+				t.Run(reason, func(t *testing.T) {
+					f, admin, cfg := managedKeycloakFixture(t, int(sessionTTL/time.Second))
+					f.requestedTTL = sessionTTL
+					first, roles := managedLogin(t, f, "sid-a")
+					expires := first.Session.GetExpiryTime()
+					require.WithinDuration(t, f.clock.Now().Add(sessionTTL), expires, 5*time.Second)
+					var marker, guard string
+					for _, name := range roles {
+						role, err := f.a.AuthServer.GetRole(f.ctx, name)
+						require.NoError(t, err)
+						require.Equal(t, sessionTTL, role.GetOptions().MaxSessionTTL.Duration())
+						if strings.HasPrefix(name, "keycloak-login-") {
+							marker = name
+						}
+						if strings.HasPrefix(name, "keycloak-guard-") {
+							guard = name
+						}
+					}
+					f.clock.Advance(6 * time.Minute)
+					require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+					locks, err := f.a.AuthServer.GetLocks(f.ctx, false, types.LockTarget{Role: marker}, types.LockTarget{Role: guard})
+					require.NoError(t, err)
+					require.Empty(t, locks, "original token expiry is not IdP logout")
+					target := types.LockTarget{Role: marker}
+					switch reason {
+					case "missed logout":
+						admin.ended.Store(true)
+					case "disabled":
+						admin.disabled.Store(true)
+						target = types.LockTarget{User: first.Username}
+					case "group removed":
+						admin.removed.Store(true)
+					case "outage":
+						admin.unavailable.Store(true)
+						f.clock.Advance(3 * time.Second)
+						target = types.LockTarget{Role: guard}
+					case "backchannel":
+						srv := managedTLS(t, f)
+						proxy, err := srv.NewClient(authtest.TestBuiltin(types.RoleProxy))
+						require.NoError(t, err)
+						defer proxy.Close()
+						raw, err := signKeycloakToken(map[string]any{"iss": f.idp.URL + "/realms/lab", "aud": "teleport-lab", "iat": f.clock.Now().Unix(), "jti": "daily-logout", "sid": "sid-a", "sub": "immutable-subject", "events": map[string]any{"http://schemas.openid.net/event/backchannel-logout": map[string]any{}}}, f.key)
+						require.NoError(t, err)
+						require.NoError(t, proxy.KeycloakLogout(f.ctx, authclient.KeycloakLogoutRequest{ConnectorID: "keycloak-lab", LogoutToken: raw}))
+					}
+					err = auth.ReconcileKeycloak(f.ctx, f.svc)
+					if reason == "outage" {
+						require.Error(t, err)
+					} else {
+						require.NoError(t, err)
+					}
+					locks, err = f.a.AuthServer.GetLocks(f.ctx, false, target)
+					require.NoError(t, err)
+					require.Len(t, locks, 1)
+					require.True(t, f.clock.Now().Before(expires), "lock must precede session expiry")
+					// Restart replays durable intent; restoring IdP availability/status
+					// must never resurrect an ended login or permanently disabled user.
+					f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+					require.NoError(t, err)
+					f.a.AuthServer.SetOIDCService(f.svc)
+					admin.unavailable.Store(false)
+					admin.disabled.Store(false)
+					admin.removed.Store(false)
+					require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+					locks, err = f.a.AuthServer.GetLocks(f.ctx, false, target)
+					require.NoError(t, err)
+					if reason == "outage" {
+						require.Empty(t, locks)
+					} else {
+						require.Len(t, locks, 1)
+					}
+				})
 			}
 		})
 	}
@@ -530,7 +534,7 @@ func TestKeycloakManagedDailySessionRejectsStaleIdentity(t *testing.T) {
 		_, err := f.svc.ValidateOIDCAuthCallback(f.ctx, q)
 		require.Error(t, err)
 	}
-	for _, seconds := range []int{-1, 299, 86401} {
+	for _, seconds := range []int{-1, 299, 2592001} {
 		_, err := auth.NewManagedKeycloakService(f.a.AuthServer, auth.KeycloakLifecycleConfig{MaxSessionSeconds: seconds})
 		require.ErrorContains(t, err, "max_session_seconds")
 	}
