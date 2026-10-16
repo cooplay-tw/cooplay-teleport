@@ -1597,7 +1597,8 @@ func localSettings(ctx context.Context, cap types.AuthPreference, logger *slog.L
 
 func oidcSettings(connector types.OIDCConnector, cap types.AuthPreference) webclient.AuthenticationSettings {
 	return webclient.AuthenticationSettings{
-		Type: constants.OIDC,
+		Type:              constants.OIDC,
+		DefaultSessionTTL: cap.GetDefaultSessionTTL(),
 		OIDC: &webclient.OIDCSettings{
 			Name:      connector.GetName(),
 			Display:   connector.GetDisplay(),

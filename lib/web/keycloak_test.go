@@ -220,3 +220,20 @@ func TestKeycloakCallbackDoesNotExposeProviderError(t *testing.T) {
 	require.Equal(t, client.LoginFailedBadCallbackRedirectURL, redirect)
 	require.Empty(t, w.Result().Cookies())
 }
+
+// A named-connector ping builds OIDC settings directly, bypassing the common
+// ping tail. Omitting the TTL makes tsh silently fall back to twelve hours.
+func TestKeycloakNamedConnectorDefaultTTL(t *testing.T) {
+	for _, ttl := range []time.Duration{time.Hour, 30 * 24 * time.Hour} {
+		preference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{DefaultSessionTTL: types.Duration(ttl)})
+		require.NoError(t, err)
+		connector, err := types.NewOIDCConnector("keycloak", types.OIDCConnectorSpecV3{
+			IssuerURL: "https://idp.example/realms/lab", ClientID: "lab", ClientSecret: "test",
+			RedirectURLs:  []string{"https://proxy.example/v1/webapi/oidc/callback"},
+			ClaimsToRoles: []types.ClaimMapping{{Claim: "groups", Value: "/lab", Roles: []string{"lab"}}},
+		})
+		require.NoError(t, err)
+		settings := oidcSettings(connector, preference)
+		require.Equal(t, ttl, settings.DefaultSessionTTL.Duration())
+	}
+}
