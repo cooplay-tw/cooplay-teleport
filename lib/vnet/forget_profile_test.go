@@ -5,6 +5,7 @@ package vnet
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -54,9 +55,17 @@ func TestForgetProfileCredentials(t *testing.T) {
 		fakeClientApp: clientApp,
 	})
 
+	// Resolve each app once and dial that address afterwards. A slow run can
+	// retransmit DNS queries and assign a second address (and handler) to the
+	// same app; dialing a fixed address keeps certificate counts exact.
+	addrs := make(map[string]string)
+	for _, host := range []string{app, multiPort, otherApp} {
+		addrs[host] = resolveIPv6(t, ctx, p, host)
+	}
 	dial := func(t *testing.T, host string, port int) error {
 		t.Helper()
-		conn, err := p.dialHost(ctx, host, port)
+		syncFakeClock(clock)
+		conn, err := p.dialHost(ctx, addrs[host], port)
 		if err != nil {
 			return err
 		}
@@ -124,17 +133,45 @@ func TestForgetProfileCredentialsBeforeLogin(t *testing.T) {
 		signatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
 	})
 	p := newTestPack(t, ctx, testPackConfig{clock: clock, fakeClientApp: clientApp})
+	addr := resolveIPv6(t, ctx, p, app)
 
-	conn, err := p.dialHost(ctx, app, 80)
+	syncFakeClock(clock)
+	conn, err := p.dialHost(ctx, addr, 80)
 	require.NoError(t, err)
 	testEchoConnection(t, conn)
 	require.NoError(t, conn.Close())
 
 	// Logout and a new login both happened before the next connection.
 	p.clientApplicationService.forgetProfile("root1.example.com")
-	conn, err = p.dialHost(ctx, app, 80)
+	syncFakeClock(clock)
+	conn, err = p.dialHost(ctx, addr, 80)
 	require.NoError(t, err, "a single connection attempt must succeed by reissuing")
 	testEchoConnection(t, conn)
 	require.NoError(t, conn.Close())
 	require.Len(t, clientApp.RequestedRouteToApps(app), 2)
+}
+
+// resolveIPv6 returns the VNet IPv6 address of host; the fake host network
+// routes only the VNet IPv6 prefix.
+func resolveIPv6(t *testing.T, ctx context.Context, p *testPack, host string) string {
+	t.Helper()
+	resolved, err := p.lookupHost(ctx, host)
+	require.NoError(t, err)
+	for _, addr := range resolved {
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() == nil {
+			return addr
+		}
+	}
+	require.FailNow(t, "no IPv6 address", "host %s resolved to %v", host, resolved)
+	return ""
+}
+
+// syncFakeClock moves the fake clock up to real time. The fake client app
+// issues certificates with a real-time NotBefore; on a slow (for example race)
+// run a frozen fake clock would make a cached certificate look not yet valid
+// and trigger reissues unrelated to the behavior under test.
+func syncFakeClock(clock *clockwork.FakeClock) {
+	if behind := time.Since(clock.Now()); behind > 0 {
+		clock.Advance(behind)
+	}
 }
