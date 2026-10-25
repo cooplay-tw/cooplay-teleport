@@ -214,7 +214,7 @@ func TestKeycloakManagedAppCredentialsKeepLoginDeadline(t *testing.T) {
 // ones synchronously from durable revocation state, and that re-enabling a
 // disabled subject never resurrects them.
 func TestKeycloakManagedAppCredentialRevocation(t *testing.T) {
-	for _, reason := range []string{"current logout", "backchannel logout", "missed logout", "group removed", "disabled"} {
+	for _, reason := range []string{"current logout", "backchannel logout", "missed logout", "group removed", "disabled", "outage"} {
 		t.Run(reason, func(t *testing.T) {
 			f, admin, cfg, srv := managedCoderFixture(t)
 			first := managedConsoleLogin(t, f, srv, "sid-a")
@@ -241,12 +241,20 @@ func TestKeycloakManagedAppCredentialRevocation(t *testing.T) {
 				admin.removed.Store(true)
 			case "disabled":
 				admin.disabled.Store(true)
+			case "outage":
+				admin.unavailable.Store(true)
+				f.clock.Advance(3 * time.Second)
 			}
-			require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+			if reason == "outage" {
+				require.Error(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+			} else {
+				require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+			}
 
-			// Every login holding the removed group, or the whole disabled
-			// account, is affected; logout variants affect only the first login.
-			otherRevoked := reason == "group removed" || reason == "disabled"
+			// Every login holding the removed group, the whole disabled account
+			// or every login of a fenced connector is affected; logout variants
+			// affect only the first login.
+			otherRevoked := reason == "group removed" || reason == "disabled" || reason == "outage"
 			for _, identity := range firstApps {
 				requireKeycloakLock(t, f, identity, true)
 			}
@@ -261,6 +269,17 @@ func TestKeycloakManagedAppCredentialRevocation(t *testing.T) {
 			require.True(t, trace.IsAccessDenied(err), "launcher session after %s: %v", reason, err)
 			if !otherRevoked {
 				keycloakAppCredentials(t, f, srv, other)
+				return
+			}
+			if reason == "outage" {
+				// The connector guard is a fence, not a revocation: fresh
+				// authoritative reconciliation restores existing credentials.
+				admin.unavailable.Store(false)
+				require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+				for _, identity := range append(slices.Clone(firstApps), otherApps...) {
+					requireKeycloakLock(t, f, identity, false)
+				}
+				keycloakAppCredentials(t, f, srv, first)
 				return
 			}
 
