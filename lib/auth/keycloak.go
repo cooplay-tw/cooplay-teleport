@@ -45,6 +45,15 @@ const (
 	keycloakRequestTTL    = 3 * time.Minute
 	keycloakUserPrefix    = "keycloak-"
 	keycloakUserLabel     = "cooplay.dev/keycloak"
+
+	// keycloakCoderAppLabelKey and keycloakCoderAppLabelValue form the only
+	// application grant a Keycloak-managed role may carry: allow.app_labels must
+	// be exactly {keycloakCoderAppLabelKey: [keycloakCoderAppLabelValue]}. Both
+	// are literals; Teleport wildcard, glob, regex and template matching are
+	// never accepted. Administrators must reserve this label for the Coder TCP
+	// application, because Teleport roles cannot restrict an app by protocol.
+	keycloakCoderAppLabelKey   = "cooplay.dev/app"
+	keycloakCoderAppLabelValue = "coder"
 )
 
 var keycloakNamespaceName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -511,12 +520,16 @@ func validateKeycloakRoleWithTTL(role types.Role, maxTTL time.Duration) error {
 	if !ok || role.GetVersion() != types.V8 {
 		return trace.AccessDenied("Keycloak requires version v8 roles")
 	}
-	// Support only SSH allow conditions. v8 leaves other resource labels empty;
-	// earlier role versions can grant wildcard resource access by default.
-	// Inspect the protobuf remainder so both new fields and unknown fields fail
-	// closed, instead of relying on an exhaustive list of non-SSH getters.
+	// Support only SSH, bounded Kubernetes pod and the exact Coder application
+	// allow conditions. v8 leaves other resource labels empty; earlier role
+	// versions can grant wildcard resource access by default. Inspect the
+	// protobuf remainder so both new fields and unknown fields fail closed,
+	// instead of relying on an exhaustive list of non-SSH getters.
 
 	allow := concrete.Spec.Allow
+	if len(allow.AppLabels) != 0 && !keycloakCoderAppGrant(allow.AppLabels) {
+		return trace.AccessDenied("Keycloak application grants require app_labels exactly %s: %s", keycloakCoderAppLabelKey, keycloakCoderAppLabelValue)
+	}
 	kubeConfigured := len(allow.KubernetesLabels)+len(allow.KubeGroups)+len(allow.KubeUsers)+len(allow.KubernetesResources) != 0
 	if kubeConfigured {
 		if len(allow.KubernetesLabels) == 0 || len(allow.KubernetesResources) == 0 || len(allow.KubeGroups)+len(allow.KubeUsers) == 0 {
@@ -547,12 +560,24 @@ func validateKeycloakRoleWithTTL(role types.Role, maxTTL time.Duration) error {
 	remaining.KubeGroups = nil
 	remaining.KubeUsers = nil
 	remaining.KubernetesResources = nil
+	// Validated above. app_labels_expression, cloud identities (AWS role ARNs,
+	// Azure identities, GCP service accounts), MCP permissions and every other
+	// application-adjacent field deliberately remain in the remainder.
+	remaining.AppLabels = nil
 	// Custom label types encode empty fields, hence compare to the empty
 	// message's encoded size rather than zero. Any other set field adds bytes.
 	if remaining.Size() != (&types.RoleConditions{}).Size() {
-		return trace.AccessDenied("Keycloak roles only support SSH and bounded Kubernetes pod access")
+		return trace.AccessDenied("Keycloak roles only support SSH, bounded Kubernetes pod and the exact Coder application access")
 	}
 	return nil
+}
+
+// keycloakCoderAppGrant accepts exactly one literal label key with exactly one
+// literal value. Exact equality excludes "*", globs, "^...$" regular expressions
+// and role templates without reimplementing Teleport's label matcher.
+func keycloakCoderAppGrant(labels types.Labels) bool {
+	values, ok := labels[keycloakCoderAppLabelKey]
+	return ok && len(labels) == 1 && len(values) == 1 && values[0] == keycloakCoderAppLabelValue
 }
 
 func (s *keycloakService) saveUser(ctx context.Context, connector, subject, username string, roles []string, expires time.Time) (types.User, error) {

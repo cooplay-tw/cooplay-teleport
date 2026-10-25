@@ -114,3 +114,161 @@ func TestKeycloakDailyRoleCapPreservesRestrictions(t *testing.T) {
 	role.Spec.Options.MaxSessionTTL = types.Duration(24*time.Hour + time.Second)
 	require.Error(t, validateKeycloakRoleWithTTL(role, 24*time.Hour))
 }
+
+func keycloakCoderRoleForValidation() *types.RoleV6 {
+	role := keycloakSSHRoleForValidation()
+	role.Spec.Allow = types.RoleConditions{
+		AppLabels: types.Labels{"cooplay.dev/app": {"coder"}},
+	}
+	return role
+}
+
+func TestKeycloakCoderAppGrant(t *testing.T) {
+	// Guard the literal contract consumed by deployment configuration.
+	require.Equal(t, "cooplay.dev/app", keycloakCoderAppLabelKey)
+	require.Equal(t, "coder", keycloakCoderAppLabelValue)
+
+	kubernetes := func(t *testing.T) *types.RoleV6 {
+		data, err := os.ReadFile("../../examples/keycloak/kubernetes-role.yaml")
+		require.NoError(t, err)
+		data, err = yaml.YAMLToJSON(data)
+		require.NoError(t, err)
+		role, err := services.UnmarshalRole(data)
+		require.NoError(t, err)
+		return role.(*types.RoleV6)
+	}
+	exact := types.Labels{"cooplay.dev/app": {"coder"}}
+
+	for _, tc := range []struct {
+		name    string
+		role    func(*testing.T) *types.RoleV6
+		allowed bool
+	}{
+		{name: "exact grant", allowed: true, role: func(*testing.T) *types.RoleV6 { return keycloakCoderRoleForValidation() }},
+		{name: "exact grant with SSH", allowed: true, role: func(*testing.T) *types.RoleV6 {
+			role := keycloakSSHRoleForValidation()
+			role.Spec.Allow.AppLabels = exact
+			return role
+		}},
+		{name: "exact grant with bounded Kubernetes", allowed: true, role: func(t *testing.T) *types.RoleV6 {
+			role := kubernetes(t)
+			role.Spec.Allow.AppLabels = exact
+			return role
+		}},
+		{name: "exact grant with invalid Kubernetes", role: func(t *testing.T) *types.RoleV6 {
+			role := kubernetes(t)
+			role.Spec.Allow.AppLabels = exact
+			role.Spec.Allow.KubernetesResources[0].Kind = "secrets"
+			return role
+		}},
+		{name: "exact grant with incomplete Kubernetes", role: func(t *testing.T) *types.RoleV6 {
+			role := keycloakCoderRoleForValidation()
+			role.Spec.Allow.KubeGroups = []string{"lab-readers"}
+			return role
+		}},
+		{name: "wildcard key and value", role: withAppLabels(types.Labels{"*": {"*"}})},
+		{name: "wildcard key", role: withAppLabels(types.Labels{"*": {"coder"}})},
+		{name: "wildcard value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"*"}})},
+		{name: "glob value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"cod*"}})},
+		{name: "regex value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"^coder$"}})},
+		{name: "open regex value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"^.*$"}})},
+		{name: "template value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"{{internal.logins}}"}})},
+		{name: "other value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"grafana"}})},
+		{name: "case variant value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"Coder"}})},
+		{name: "case variant key", role: withAppLabels(types.Labels{"Cooplay.dev/app": {"coder"}})},
+		{name: "other key", role: withAppLabels(types.Labels{"app": {"coder"}})},
+		{name: "extra label", role: withAppLabels(types.Labels{"cooplay.dev/app": {"coder"}, "environment": {"lab"}})},
+		{name: "extra value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"coder", "grafana"}})},
+		{name: "duplicate value", role: withAppLabels(types.Labels{"cooplay.dev/app": {"coder", "coder"}})},
+		{name: "empty value list", role: withAppLabels(types.Labels{"cooplay.dev/app": {}})},
+		{name: "expression only", role: func(*testing.T) *types.RoleV6 {
+			role := keycloakSSHRoleForValidation()
+			role.Spec.Allow.AppLabelsExpression = `labels["cooplay.dev/app"] == "coder"`
+			return role
+		}},
+		{name: "expression with exact grant", role: func(*testing.T) *types.RoleV6 {
+			role := keycloakCoderRoleForValidation()
+			role.Spec.Allow.AppLabelsExpression = `labels["cooplay.dev/app"] == "coder"`
+			return role
+		}},
+		{name: "AWS role ARNs", role: withCoderGrant(func(c *types.RoleConditions) {
+			c.AWSRoleARNs = []string{"arn:aws:iam::123456789012:role/lab"}
+		})},
+		{name: "Azure identities", role: withCoderGrant(func(c *types.RoleConditions) {
+			c.AzureIdentities = []string{"/subscriptions/0/resourceGroups/lab/providers/Microsoft.ManagedIdentity/userAssignedIdentities/lab"}
+		})},
+		{name: "GCP service accounts", role: withCoderGrant(func(c *types.RoleConditions) {
+			c.GCPServiceAccounts = []string{"lab@example.iam.gserviceaccount.com"}
+		})},
+		{name: "MCP tools", role: withCoderGrant(func(c *types.RoleConditions) { c.MCP = &types.MCPPermissions{Tools: []string{"*"}} })},
+		{name: "empty MCP permissions", role: withCoderGrant(func(c *types.RoleConditions) { c.MCP = &types.MCPPermissions{} })},
+		{name: "database labels", role: withCoderGrant(func(c *types.RoleConditions) { c.DatabaseLabels = types.Labels{"cooplay.dev/app": {"coder"}} })},
+		{name: "desktop labels", role: withCoderGrant(func(c *types.RoleConditions) {
+			c.WindowsDesktopLabels = types.Labels{"cooplay.dev/app": {"coder"}}
+		})},
+		{name: "admin rules", role: withCoderGrant(func(c *types.RoleConditions) {
+			c.Rules = []types.Rule{{Resources: []string{types.KindApp}, Verbs: []string{types.VerbList}}}
+		})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateKeycloakRole(tc.role(t))
+			if tc.allowed {
+				require.NoError(t, err)
+				return
+			}
+			require.True(t, trace.IsAccessDenied(err), "unexpectedly accepted: %v", err)
+		})
+	}
+
+	t.Run("unknown protobuf field with exact grant", func(t *testing.T) {
+		role := keycloakCoderRoleForValidation()
+		require.NoError(t, role.Spec.Allow.Unmarshal([]byte{0xc2, 0x3e, 0x01, 'x'}))
+		require.Equal(t, exact, role.Spec.Allow.AppLabels, "unknown field decode must keep the exact grant")
+		require.True(t, trace.IsAccessDenied(validateKeycloakRole(role)))
+	})
+	t.Run("session requirements still apply", func(t *testing.T) {
+		for _, mutate := range []func(*types.RoleV6){
+			func(r *types.RoleV6) { r.Spec.Options.MaxSessionTTL = types.Duration(time.Hour) },
+			func(r *types.RoleV6) { r.Spec.Options.MaxSessionTTL = 0 },
+			func(r *types.RoleV6) { r.Spec.Options.DisconnectExpiredCert = false },
+			func(r *types.RoleV6) { r.Spec.Options.Lock = constants.LockingModeBestEffort },
+			func(r *types.RoleV6) { r.Version = types.V7 },
+		} {
+			role := keycloakCoderRoleForValidation()
+			mutate(role)
+			require.True(t, trace.IsAccessDenied(validateKeycloakRole(role)))
+		}
+		role := keycloakCoderRoleForValidation()
+		role.Spec.Options.MaxSessionTTL = types.Duration(30 * 24 * time.Hour)
+		require.NoError(t, validateKeycloakRoleWithTTL(role, 30*24*time.Hour))
+		require.Error(t, validateKeycloakRoleWithTTL(role, 24*time.Hour))
+	})
+	t.Run("published example", func(t *testing.T) {
+		data, err := os.ReadFile("../../examples/keycloak/coder-app-role.yaml")
+		require.NoError(t, err)
+		data, err = yaml.YAMLToJSON(data)
+		require.NoError(t, err)
+		role, err := services.UnmarshalRole(data)
+		require.NoError(t, err)
+		require.Equal(t, exact, role.GetAppLabels(types.Allow))
+		require.Empty(t, role.GetLogins(types.Allow))
+		require.Empty(t, role.GetKubernetesLabels(types.Allow))
+		require.NoError(t, validateKeycloakRole(role))
+	})
+}
+
+func withAppLabels(labels types.Labels) func(*testing.T) *types.RoleV6 {
+	return func(*testing.T) *types.RoleV6 {
+		role := keycloakSSHRoleForValidation()
+		role.Spec.Allow.AppLabels = labels
+		return role
+	}
+}
+
+func withCoderGrant(mutate func(*types.RoleConditions)) func(*testing.T) *types.RoleV6 {
+	return func(*testing.T) *types.RoleV6 {
+		role := keycloakCoderRoleForValidation()
+		mutate(&role.Spec.Allow)
+		return role
+	}
+}

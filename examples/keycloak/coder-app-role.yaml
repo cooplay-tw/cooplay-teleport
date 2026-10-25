@@ -1,0 +1,22 @@
+# Non-secret example: the only application grant a Keycloak-managed role may
+# carry. Reserve the cooplay.dev/app=coder label for the Coder TCP application;
+# Teleport roles cannot restrict app access by protocol. Coder still performs
+# its own OIDC login; this grant only reaches its network entry point.
+kind: role
+version: v8
+metadata:
+  name: keycloak-lab-coder
+spec:
+  options:
+    max_session_ttl: 5m
+    disconnect_expired_cert: true
+    lock: strict
+    forward_agent: false
+    ssh_file_copy: false
+    ssh_port_forwarding:
+      local: {enabled: false}
+      remote: {enabled: false}
+    record_session: {ssh: strict}
+  allow:
+    app_labels:
+      cooplay.dev/app: coder
