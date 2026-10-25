@@ -4,6 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 repo_dir=$(pwd -P)
+# In a git worktree, .git is a file naming a directory outside the checkout.
+# Mount the shared git directory read-only at its host path so revision and
+# dirty-state provenance also works inside the Linux builders.
+git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
 ui_image=$(python3 -c 'import json; print(json.load(open("build.assets/cooplay/toolchains.json"))["ui_linux_arm64"])')
 export GOTOOLCHAIN=go1.25.14 CGO_ENABLED=1 TZ=UTC LC_ALL=C
 case "${1:-all}" in
@@ -17,6 +21,7 @@ case "${1:-all}" in
   docker pull "$ui_image"
   docker run --rm --platform=linux/arm64 --user=0 \
     --mount "type=bind,source=$repo_dir,target=/workspace" --workdir=/workspace \
+    --mount "type=bind,source=$git_common_dir,target=$git_common_dir,readonly" \
     --env GIT_CONFIG_COUNT=1 --env GIT_CONFIG_KEY_0=safe.directory --env GIT_CONFIG_VALUE_0=/workspace \
     --mount "type=bind,source=$linux_go,target=/opt/go,readonly" \
     --env GOROOT=/opt/go --env PATH=/opt/go/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -78,6 +83,7 @@ case "${1:-all}" in
   mkdir -p "$GOCACHE/linux-$target_arch"
   docker run --rm --platform=linux/$target_arch --user=0 \
     --mount "type=bind,source=$repo_dir,target=/workspace" --workdir=/workspace \
+    --mount "type=bind,source=$git_common_dir,target=$git_common_dir,readonly" \
     --mount "type=bind,source=$linux_go,target=/opt/go,readonly" \
     --mount "type=bind,source=$GOMODCACHE,target=/gomod" \
     --mount "type=bind,source=$GOCACHE/linux-$target_arch,target=/gocache" \
