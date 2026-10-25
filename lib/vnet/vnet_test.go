@@ -79,7 +79,8 @@ func TestMain(m *testing.M) {
 }
 
 type testPack struct {
-	hostNetwork *FakeHostNetwork
+	hostNetwork              *FakeHostNetwork
+	clientApplicationService *clientApplicationService
 }
 
 type testPackConfig struct {
@@ -106,7 +107,7 @@ func newTestPack(t *testing.T, ctx context.Context, cfg testPackConfig) *testPac
 	// client application and communicates over gRPC. For the test, everything
 	// runs in a single process, but we still set up the gRPC service and only
 	// interface with fakeClientApp via the gRPC client.
-	clt := runTestClientApplicationService(t, ctx, cfg)
+	clt, clientApplicationService := runTestClientApplicationService(t, ctx, cfg)
 	appProvider := newAppProvider(clt)
 	sshProvider, err := newSSHProvider(ctx, sshProviderConfig{
 		clt:                clt,
@@ -159,7 +160,8 @@ func newTestPack(t *testing.T, ctx context.Context, cfg testPackConfig) *testPac
 	})
 
 	return &testPack{
-		hostNetwork: hostNetwork,
+		hostNetwork:              hostNetwork,
+		clientApplicationService: clientApplicationService,
 	}
 }
 
@@ -199,8 +201,9 @@ func (p *testPack) dialHost(ctx context.Context, host string, port int) (net.Con
 
 // runTestClientApplicationService runs the gRPC service that's normally used to
 // expose the client application and Teleport client methods to the VNet
-// admin/networking process over gRPC. It returns a client of the gRPC service.
-func runTestClientApplicationService(t *testing.T, ctx context.Context, cfg testPackConfig) *clientApplicationServiceClient {
+// admin/networking process over gRPC. It returns a client of the gRPC service
+// and the service itself.
+func runTestClientApplicationService(t *testing.T, ctx context.Context, cfg testPackConfig) (*clientApplicationServiceClient, *clientApplicationService) {
 	clusterConfigCache := NewClusterConfigCache(cfg.clock)
 	leafClusterCache, err := newLeafClusterCache(cfg.clock)
 	require.NoError(t, err)
@@ -254,7 +257,7 @@ func runTestClientApplicationService(t *testing.T, ctx context.Context, cfg test
 	clt, err := newClientApplicationServiceClient(ctx, clientCreds, listener.Addr().String())
 	require.NoError(t, err)
 	t.Cleanup(func() { clt.close() })
-	return clt
+	return clt, clientApplicationService
 }
 
 type noUpstreamNameservers struct{}
@@ -317,6 +320,10 @@ type fakeClientApp struct {
 
 	teleportHostCA ssh.Signer
 	teleportUserCA ssh.Signer
+
+	// reissueAppCertErr, when set, fails ReissueAppCert like a logged-out
+	// client application.
+	reissueAppCertErr atomic.Pointer[error]
 
 	onNewSSHSessionCallCount    atomic.Uint32
 	onNewAppConnectionCallCount atomic.Uint32
@@ -421,6 +428,9 @@ func (p *fakeClientApp) GetCachedClient(ctx context.Context, profileName, leafCl
 }
 
 func (p *fakeClientApp) ReissueAppCert(ctx context.Context, appInfo *vnetv1.AppInfo, targetPort uint16) (tls.Certificate, error) {
+	if err := p.reissueAppCertErr.Load(); err != nil {
+		return tls.Certificate{}, *err
+	}
 	p.requestedRouteToAppsMu.Lock()
 	defer p.requestedRouteToAppsMu.Unlock()
 

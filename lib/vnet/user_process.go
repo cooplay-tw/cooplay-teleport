@@ -190,6 +190,16 @@ func (p *UserProcess) NetworkStackInfo() *vnetv1.NetworkStackInfo {
 	return p.networkStackInfo
 }
 
+// ForgetProfileCredentials makes VNet stop using app certificates issued for
+// profileName before this call. Client applications call it after logging out
+// of the profile: the next connection to each of its apps reissues a
+// certificate with the profile's current credentials (prompting for login if
+// there are none) instead of reusing one cached by the admin process.
+// Connections that are already established are not interrupted.
+func (p *UserProcess) ForgetProfileCredentials(profileName string) {
+	p.clientApplicationService.forgetProfile(profileName)
+}
+
 // GetTargetOSConfiguration returns the LocalOSConfigProvider which clients may
 // use to report the proxied DNS zones, run diagnostics, etc. The returned
 // *LocalOSConfigProvider will remain valid even if the UserProcess is closed.

@@ -22,6 +22,7 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"maps"
 	"sync"
 	"time"
 
@@ -56,10 +57,10 @@ type clientApplicationService struct {
 	// appSignerCache caches the crypto.Signer for each certificate issued by
 	// ReissueAppCert so that SignForApp can later use that signer.
 	//
-	// Signers are never deleted from the map. When the cert expires, the local
-	// proxy in the admin process will detect the cert expiry and call
-	// ReissueAppCert, which will overwrite the signer for the app with a new
-	// one.
+	// When the cert expires, the local proxy in the admin process will detect
+	// the cert expiry and call ReissueAppCert, which will overwrite the signer
+	// for the app with a new one. Signers are deleted only by forgetProfile
+	// after a logout; the admin process then reissues on its next connection.
 	appSignerCache map[appKey]crypto.Signer
 
 	// sshSigners is a cache containing [crypto.Signer]s keyed by SSH session
@@ -178,7 +179,8 @@ func (s *clientApplicationService) SignForApp(ctx context.Context, req *vnetv1.S
 	}
 	signer, ok := s.getSignerForApp(req.GetAppKey(), uint16(req.GetTargetPort()))
 	if !ok {
-		return nil, trace.BadParameter("no signer for app %v", appKey)
+		// NotFound tells the admin process to reissue the certificate.
+		return nil, trace.NotFound("no signer for app %v", appKey)
 	}
 
 	signature, err := sign(signer, signReq)
@@ -215,6 +217,18 @@ func (s *clientApplicationService) setSignerForApp(appKey *vnetv1.AppKey, target
 	s.appSignerMu.Lock()
 	defer s.appSignerMu.Unlock()
 	s.appSignerCache[newAppKey(appKey, targetPort)] = signer
+}
+
+// forgetProfile deletes the cached app signers of every app in the profile,
+// including its leaf clusters. Certificates that the admin process still
+// caches for those apps can then no longer complete a TLS handshake, so the
+// next connection reissues them with the profile's current credentials.
+func (s *clientApplicationService) forgetProfile(profileName string) {
+	s.appSignerMu.Lock()
+	defer s.appSignerMu.Unlock()
+	maps.DeleteFunc(s.appSignerCache, func(key appKey, _ crypto.Signer) bool {
+		return key.profile == profileName
+	})
 }
 
 func (s *clientApplicationService) getSignerForApp(appKey *vnetv1.AppKey, targetPort uint16) (crypto.Signer, bool) {

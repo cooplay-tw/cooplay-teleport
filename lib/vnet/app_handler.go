@@ -18,11 +18,14 @@ package vnet
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
@@ -41,9 +44,11 @@ type appHandler struct {
 	cfg *appHandlerConfig
 	log *slog.Logger
 
-	// mu guards access to portToLocalProxy.
+	// mu guards access to portToLocalProxy and portToCertIssuer.
 	mu               sync.Mutex
 	portToLocalProxy map[uint16]*alpnproxy.LocalProxy
+	// portToCertIssuer holds the certificate issuer of each local proxy.
+	portToCertIssuer map[uint16]*appCertIssuer
 }
 
 type appHandlerConfig struct {
@@ -67,12 +72,13 @@ func newAppHandler(cfg *appHandlerConfig) *appHandler {
 			"leaf_cluster", cfg.appInfo.GetAppKey().GetLeafCluster(),
 			"fqdn", cfg.appInfo.GetApp().GetPublicAddr()),
 		portToLocalProxy: make(map[uint16]*alpnproxy.LocalProxy),
+		portToCertIssuer: make(map[uint16]*appCertIssuer),
 	}
 }
 
 // getOrInitializeLocalProxy returns a separate local proxy for each port for multi-port apps. For
 // single-port apps, it returns the same local proxy no matter the port.
-func (h *appHandler) getOrInitializeLocalProxy(ctx context.Context, localPort uint16) (*alpnproxy.LocalProxy, error) {
+func (h *appHandler) getOrInitializeLocalProxy(ctx context.Context, localPort uint16) (*alpnproxy.LocalProxy, *appCertIssuer, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// Connections to single-port apps need to go through a local proxy that has a cert with TargetPort
@@ -85,7 +91,7 @@ func (h *appHandler) getOrInitializeLocalProxy(ctx context.Context, localPort ui
 	}
 	lp, ok := h.portToLocalProxy[localPort]
 	if ok {
-		return lp, nil
+		return lp, h.portToCertIssuer[localPort], nil
 	}
 	appCertIssuer := &appCertIssuer{
 		appProvider: h.cfg.appProvider,
@@ -109,10 +115,11 @@ func (h *appHandler) getOrInitializeLocalProxy(ctx context.Context, localPort ui
 		alwaysTrustRootClusterCA: h.cfg.alwaysTrustRootClusterCA,
 	})
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, nil, trace.Wrap(err)
 	}
 	h.portToLocalProxy[localPort] = newLP
-	return newLP, nil
+	h.portToCertIssuer[localPort] = appCertIssuer
+	return newLP, appCertIssuer, nil
 }
 
 // handleTCPConnector handles an incoming TCP connection from VNet by passing it to the local alpn proxy,
@@ -126,11 +133,28 @@ func (h *appHandler) handleTCPConnector(ctx context.Context, localPort uint16, c
 		}
 	}
 
-	lp, err := h.getOrInitializeLocalProxy(ctx, localPort)
+	lp, certIssuer, err := h.getOrInitializeLocalProxy(ctx, localPort)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	return trace.Wrap(lp.HandleTCPConnector(ctx, connector), "handling TCP connector")
+	// The client application drops the keys of a profile's app certificates
+	// when the user logs out (see [UserProcess.ForgetProfileCredentials]). The
+	// cached certificate then fails its TLS handshake before the downstream
+	// connection is accepted. Retry once: the cert checker now rejects the
+	// cached certificate and reissues with the profile's current credentials,
+	// prompting for login if there are none, instead of reusing a certificate
+	// issued before the logout until it expires.
+	connectorCalled := false
+	trackedConnector := func() (net.Conn, error) {
+		connectorCalled = true
+		return connector()
+	}
+	err = lp.HandleTCPConnector(ctx, trackedConnector)
+	if err != nil && !connectorCalled && certIssuer.signerLost() {
+		h.log.DebugContext(ctx, "App certificate key was cleared by the client application, reissuing", "error", err)
+		err = lp.HandleTCPConnector(ctx, trackedConnector)
+	}
+	return trace.Wrap(err, "handling TCP connector")
 }
 
 // appCertIssuer implements [client.CertIssuer].
@@ -139,10 +163,14 @@ type appCertIssuer struct {
 	appInfo     *vnetv1.AppInfo
 	targetPort  uint16
 	group       singleflight.Group
+	// signer tracks the key of the most recently issued certificate.
+	signer atomic.Pointer[trackedAppSigner]
 }
 
 func (i *appCertIssuer) CheckCert(cert *x509.Certificate) error {
-	// appCertIssuer does not perform any additional certificate checks.
+	if i.signerLost() {
+		return trace.CompareFailed("app certificate key is no longer held by the client application")
+	}
 	return nil
 }
 
@@ -150,7 +178,39 @@ func (i *appCertIssuer) IssueCert(ctx context.Context) (tls.Certificate, error) 
 	cert, err, _ := i.group.Do("", func() (any, error) {
 		return i.appProvider.ReissueAppCert(ctx, i.appInfo, i.targetPort)
 	})
-	return cert.(tls.Certificate), trace.Wrap(err)
+	if err != nil {
+		return tls.Certificate{}, trace.Wrap(err)
+	}
+	tlsCert := cert.(tls.Certificate)
+	if signer, ok := tlsCert.PrivateKey.(crypto.Signer); ok {
+		tracked := &trackedAppSigner{Signer: signer}
+		tlsCert.PrivateKey = tracked
+		i.signer.Store(tracked)
+	}
+	return tlsCert, nil
+}
+
+// signerLost reports whether the client application no longer holds the key
+// of the most recently issued certificate.
+func (i *appCertIssuer) signerLost() bool {
+	signer := i.signer.Load()
+	return signer != nil && signer.lost.Load()
+}
+
+// trackedAppSigner records when the client application reports that it no
+// longer holds the key of an app certificate.
+type trackedAppSigner struct {
+	crypto.Signer
+	lost atomic.Bool
+}
+
+// Sign implements [crypto.Signer].
+func (s *trackedAppSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	signature, err := s.Signer.Sign(rand, digest, opts)
+	if trace.IsNotFound(err) {
+		s.lost.Store(true)
+	}
+	return signature, err
 }
 
 // IsHTTPSTunnelApp returns true if the app should be proxied through the
