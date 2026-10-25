@@ -68,6 +68,9 @@ type Service struct {
 	vnetProcess        *vnet.UserProcess
 	clusterConfigCache *vnet.ClusterConfigCache
 	networkStackInfo   *vnetv1.NetworkStackInfo
+	// credentialsProcess is the running VNet process, read without mu by
+	// forgetProfileCredentials.
+	credentialsProcess atomic.Pointer[vnet.UserProcess]
 }
 
 // New creates an instance of Service.
@@ -76,10 +79,12 @@ func New(cfg Config) (*Service, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	return &Service{
+	s := &Service{
 		cfg:                cfg,
 		clusterConfigCache: vnet.NewClusterConfigCache(cfg.Clock),
-	}, nil
+	}
+	cfg.DaemonService.AddLogoutHook(s.forgetProfileCredentials)
+	return s, nil
 }
 
 type Config struct {
@@ -173,6 +178,7 @@ func (s *Service) Start(ctx context.Context, req *api.StartRequest) (*api.StartR
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	s.credentialsProcess.Store(vnetProcess)
 
 	go func() {
 		err := vnetProcess.Wait()
@@ -380,6 +386,7 @@ func (s *Service) stopLocked() error {
 		return nil
 	}
 
+	s.credentialsProcess.Store(nil)
 	s.vnetProcess.Close()
 	err := s.vnetProcess.Wait()
 	if err != nil && !errors.Is(err, context.Canceled) {

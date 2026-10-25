@@ -26,12 +26,29 @@ import { LoggedInUser } from 'gen-proto-ts/teleport/lib/teleterm/v1/cluster_pb';
 
 import Logger from 'teleterm/logger';
 import { TshdClient } from 'teleterm/services/tshd';
+import { isRpcError } from 'teleterm/services/tshd/cloneableClient';
 import { ClusterUri, RootClusterUri, routing } from 'teleterm/ui/uri';
 
 import { AwaitableSender } from '../awaitableSender';
 import type { WindowsManager } from '../windowsManager';
 
 export type State = ReadonlyMap<ClusterUri, Cluster>;
+
+/**
+ * tshd returns this error from Logout after it has already cleared the local
+ * credentials, when the server did not confirm that the Keycloak login was
+ * revoked (Cooplay fork). See client.ErrKeycloakRevocationNotConfirmed.
+ */
+function isLocalLogoutWithUnconfirmedRevocation(error: unknown): boolean {
+  if (!isRpcError(error, 'UNAVAILABLE')) {
+    return false;
+  }
+  const message = (error as { message?: unknown }).message;
+  return (
+    typeof message === 'string' &&
+    message.includes('Keycloak credential revocation was not confirmed')
+  );
+}
 
 export type ClusterStoreUpdate =
   /**
@@ -85,7 +102,17 @@ export class ClusterStore {
     { removeProfile = false }: { removeProfile?: boolean } = {}
   ): Promise<void> {
     const client = await this.getTshdClient();
-    await client.logout({ clusterUri: uri, removeProfile });
+    let unconfirmedRevocation: unknown;
+    try {
+      await client.logout({ clusterUri: uri, removeProfile });
+    } catch (error) {
+      if (!isLocalLogoutWithUnconfirmedRevocation(error)) {
+        throw error;
+      }
+      // Local credentials were cleared. Mirror the logged-out state, then
+      // surface the error to the caller.
+      unconfirmedRevocation = error;
+    }
     await this.update(draft => {
       for (let d of draft.values()) {
         if (!routing.belongsToProfile(uri, d.uri)) {
@@ -105,6 +132,9 @@ export class ClusterStore {
         }
       }
     });
+    if (unconfirmedRevocation) {
+      throw unconfirmedRevocation;
+    }
   }
 
   /**

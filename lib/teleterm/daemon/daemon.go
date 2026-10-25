@@ -335,13 +335,21 @@ func (s *Service) ResolveClusterWithDetails(ctx context.Context, uri string) (*c
 // ClusterLogout logs the user out of the cluster and cleans up associated resources.
 // Optionally removes the profile.
 // This operation is idempotent and can be safely invoked multiple times.
+//
+// If the server did not confirm revocation of a Keycloak login, the remaining
+// local cleanup still runs and client.ErrKeycloakRevocationNotConfirmed is
+// returned at the end. Logout hooks run in every case.
 func (s *Service) ClusterLogout(ctx context.Context, uri uri.ResourceURI, removeProfile bool) error {
+	defer s.logoutHooks.run(uri.GetProfileName())
 	cluster, _, err := s.ResolveClusterURI(uri)
 	if err != nil && !trace.IsNotFound(err) {
 		return trace.Wrap(err)
 	}
+	var revocationErr error
 	if err == nil {
-		if err = cluster.Logout(ctx); err != nil {
+		if err = cluster.Logout(ctx); client.IsKeycloakRevocationNotConfirmed(err) {
+			revocationErr = err
+		} else if err != nil {
 			return trace.Wrap(err)
 		}
 		if removeProfile {
@@ -355,7 +363,10 @@ func (s *Service) ClusterLogout(ctx context.Context, uri uri.ResourceURI, remove
 		return trace.Wrap(err)
 	}
 
-	return trace.Wrap(s.ClearStaleCachedClientsForRoot(uri))
+	if err := s.ClearStaleCachedClientsForRoot(uri); err != nil {
+		return trace.Wrap(err)
+	}
+	return trace.Wrap(revocationErr)
 }
 
 // CreateGateway creates a gateway to given targetURI
@@ -1358,6 +1369,8 @@ type Service struct {
 	headlessWatcherClosers   map[string]context.CancelFunc
 	headlessWatcherClosersMu sync.Mutex
 	clientCache              ClientCache
+	// logoutHooks run after ClusterLogout, see AddLogoutHook.
+	logoutHooks logoutHooks
 }
 
 type CreateGatewayParams struct {

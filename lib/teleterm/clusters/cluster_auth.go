@@ -65,8 +65,22 @@ func (c *Cluster) SyncAuthPreference(ctx context.Context) (*webclient.WebConfigA
 	return &cfg.Auth, pingResponse, nil
 }
 
-// Logout deletes all cluster certificates
+// Logout deletes all cluster certificates.
+//
+// For a profile holding a Keycloak login, the current login is first revoked
+// server-side, as `tsh logout` does. Local credentials are always deleted; if
+// the revocation was not confirmed, [client.ErrKeycloakRevocationNotConfirmed]
+// is returned after local cleanup succeeded.
 func (c *Cluster) Logout(ctx context.Context) error {
+	revocationErr := c.revokeKeycloakLoginBeforeLogout(ctx)
+	if err := c.deleteLocalCredentials(); err != nil {
+		return trace.NewAggregate(err, revocationErr)
+	}
+	return trace.Wrap(revocationErr)
+}
+
+// deleteLocalCredentials deletes all local cluster certificates.
+func (c *Cluster) deleteLocalCredentials() error {
 	// Delete db certs
 	for _, db := range c.status.Databases {
 		err := dbprofile.Delete(c.clusterClient, db)

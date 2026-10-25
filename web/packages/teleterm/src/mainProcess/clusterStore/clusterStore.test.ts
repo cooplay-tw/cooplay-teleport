@@ -125,6 +125,46 @@ test('logs out of cluster and removes profile', async () => {
   expect(state.get(leafCluster.uri)).toBeUndefined();
 });
 
+test('logs out locally when Keycloak revocation is not confirmed', async () => {
+  const { clusterStore, logoutMock } = getTestSetup();
+  await clusterStore.sync(cluster.uri);
+  const error = {
+    name: 'RpcError',
+    code: 'UNAVAILABLE',
+    message:
+      'Local credentials cleared; Keycloak credential revocation was not confirmed',
+  };
+  logoutMock.mockReturnValueOnce(new MockedUnaryCall({}, error));
+
+  await expect(clusterStore.logout(cluster.uri)).rejects.toBe(error);
+
+  const state = clusterStore.getState();
+  expect(state.get(clusterWithDetails.uri)).toEqual(
+    expect.objectContaining({
+      connected: false,
+      loggedInUser: LoggedInUser.create(),
+    })
+  );
+  expect(state.get(leafCluster.uri)).toBeUndefined();
+});
+
+test('keeps the cluster state when logout fails', async () => {
+  const { clusterStore, logoutMock } = getTestSetup();
+  await clusterStore.sync(cluster.uri);
+  const error = {
+    name: 'RpcError',
+    code: 'UNAVAILABLE',
+    message: 'connection refused',
+  };
+  logoutMock.mockReturnValueOnce(new MockedUnaryCall({}, error));
+
+  await expect(clusterStore.logout(cluster.uri)).rejects.toBe(error);
+
+  const state = clusterStore.getState();
+  expect(state.get(clusterWithDetails.uri)).toStrictEqual(clusterWithDetails);
+  expect(state.get(leafCluster.uri)).toStrictEqual(leafCluster);
+});
+
 function getTestSetup() {
   const mockClient = new MockTshClient();
   mockClient.getCluster = () => new MockedUnaryCall(clusterWithDetails);
