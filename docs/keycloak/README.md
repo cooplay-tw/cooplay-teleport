@@ -56,13 +56,18 @@ accept only authenticated native Proxy identities.
 - Literal full group paths map to existing static roles. Unmapped users,
   regexes/globs/templates, role impersonation and access-request augmentation fail.
   The Admin API rechecks enabled status and groups at every login.
-- Supported resource grants are SSH and Kubernetes. Role v8, strict locking,
+- Supported resource grants are SSH, Kubernetes and one exact application grant
+  for Coder. Role v8, strict locking,
   disconnect on expiry and an explicit bounded TTL are mandatory (five minutes by default; managed deployments may opt into at most 30 days). SSH grants
   require explicit unprivileged logins and labels; forwarding/file copy are off.
   Kubernetes grants require explicit labels, users/groups, namespaces and verbs;
-  exec requires an exact pod name. App/DB/desktop/cloud/admin grants are rejected.
-  See [SSH example](../../examples/keycloak/role.yaml) and
-  [Kubernetes example](../../examples/keycloak/kubernetes-role.yaml).
+  exec requires an exact pod name. The only application grant is `app_labels`
+  exactly `cooplay.dev/app: coder` ([Coder application access](#coder-application-access)).
+  Other app labels, wildcards, globs, regular expressions, `app_labels_expression`,
+  AWS/Azure/GCP identities, MCP, DB, desktop and admin grants are rejected.
+  See [SSH example](../../examples/keycloak/role.yaml),
+  [Kubernetes example](../../examples/keycloak/kubernetes-role.yaml) and
+  [Coder example](../../examples/keycloak/coder-app-role.yaml).
 - Teleport signs the normal SSH/TLS credentials. Lifetime is the minimum of
   requested TTL, role TTL and the Auth-local session cap. The default also caps
   the session at the ID-token remaining lifetime. With an explicit managed cap
@@ -153,7 +158,7 @@ Cloud secret refresh failure is distinct from an unavailable authoritative IdP.
 
 | Trigger | Implemented behavior |
 | --- | --- |
-| Web or `tsh logout` | Revoke the current login marker server-side before local cleanup. A copied session/certificate and its active connections are denied by native locks; another independent login remains valid. If remote revocation cannot be confirmed, cleanup still runs and the caller receives an error. |
+| Web, `tsh logout` or Teleport Connect logout | Revoke the current login marker server-side before local cleanup. A copied session/certificate and its active connections are denied by native locks; another independent login remains valid. If remote revocation cannot be confirmed, cleanup still runs and the caller receives an error (see [Connect logout and VNet](#teleport-connect-logout-and-vnet)). |
 | Keycloak back-channel logout | Verify a signed logout JWT, exact event, issuer/audience, recent issue time, no nonce, subject/session and replay identity. Lock all matching existing login generations; fresh authentication is allowed. Identical retries finish idempotently; a changed payload reusing a `jti` fails. |
 | Missed Keycloak logout notification | Read-only session reconciliation detects the missing session or client binding and durably revokes matching login markers. Another active session and future authentication remain usable. |
 | Group removed | Reconciliation locks affected old login markers. Fresh login may obtain remaining/current mappings. Re-adding a group never unlocks an old marker. |
@@ -190,6 +195,129 @@ just the configured poll interval; credentials independently expire within the c
 (five minutes by default). The local outage measurement is evidence for that fixture, not a
 production latency guarantee. Native tsh may retry a disconnected session;
 the outage/expiry probes use `--no-resume` to measure actual termination.
+
+## Coder application access
+
+Employees reach a self-hosted Coder only as a Teleport **TCP application**
+through Teleport VNet; Coder still performs its own OIDC login. A TCP app
+carries no identity headers, so reaching Coder through VNet never logs a user
+into Coder.
+
+### Grant shape
+
+A Keycloak-managed role may add exactly:
+
+```yaml
+allow:
+  app_labels:
+    cooplay.dev/app: coder
+```
+
+The key and the single value are compared literally (constants in
+`lib/auth/keycloak.go`). A wildcard key or value, a glob, a `^...$` regular
+expression, a template, an extra label or value, an empty value list or any
+`app_labels_expression` is rejected, as are `aws_role_arns`,
+`azure_identities`, `gcp_service_accounts`, `mcp` and unknown protobuf fields.
+The grant may be combined with SSH or Kubernetes grants only if those remain
+valid on their own; TTL, `disconnect_expired_cert`, strict locking and v8 are
+unchanged. Teleport roles cannot restrict an app by protocol: reserve the
+`cooplay.dev/app=coder` label for the single Coder TCP application and never put
+it on an HTTP, MCP or cloud application.
+
+### Application credentials keep the login deadline
+
+| Issuance path | Bound for a Keycloak login |
+| --- | --- |
+| In-memory app certificate (VNet, Connect, `tsh proxy app`) via `GenerateUserCerts` with `RouteToApp` | Capped at the earlier of the caller certificate and the stored user expiry (the login deadline). Natively this flow may use a full role TTL measured from now. Durable revocation state is rechecked; overlong results are deleted and rejected. |
+| App session linked to that certificate | Same cap; created with reserved signing time and verified against the absolute deadline. |
+| Web launcher / direct `CreateAppSession` | Natively follows only the caller certificate. The fork also rechecks durable revocation, caps at the stored user expiry and rejects/deletes an overlong session. |
+| App web session renewal | Not renewable; a new launcher session is bounded as above. |
+
+The stored user resource expires at the newest login's deadline, so a newer,
+shorter login also shortens app credentials of older logins (they would stop
+working when the user resource expires anyway).
+
+### Revocation covers application credentials
+
+Every app certificate and app session carries the login marker and connector
+guard roles of the login that created it. The same native strict locks used for
+SSH therefore apply: current logout, back-channel logout, missed IdP logout,
+group removal, IdP outage fencing and account disable deny new app connections
+at the app agent, whose connection monitor closes established TCP app
+connections when a lock appears or the certificate expires. Auth also refuses
+new app certificates and launcher sessions immediately from durable state.
+Re-enabling the same Keycloak subject, restoring a group or restarting Auth does
+not resurrect them. These properties are covered by auth-server tests
+(`TestKeycloakManagedAppCredentialsKeepLoginDeadline`,
+`TestKeycloakManagedAppCredentialRevocation`).
+
+### Teleport Connect logout and VNet
+
+Connect logout now matches `tsh logout`. For a profile whose key ring holds a
+Keycloak login, tshd revokes the current login marker server-side **before**
+deleting database certificates, kubeconfig entries and keys. Local cleanup,
+profile removal, headless watcher and client-cache cleanup always run. If
+revocation is not confirmed (proxy unreachable, credential already expired),
+the Logout RPC returns gRPC `UNAVAILABLE` with
+`Local credentials cleared; Keycloak credential revocation was not confirmed`.
+Connect still shows the cluster as logged out, and the logout dialog displays
+that message under "Could not log out". A repeated logout (for example by the
+profile watcher after keys disappear, or after `tsh logout`) finds no key ring
+and makes no second revocation attempt. Non-Keycloak profiles are unaffected.
+
+Before this change Connect logout did not touch a running VNet. VNet caches one
+app certificate per app (and per port of multi-port apps) in its networking
+process and reuses it for every new TCP connection until it expires; the private
+key stays in the tshd/VNet user process. After a logout VNet therefore kept
+proxying new connections with pre-logout certificates, and after a server-side
+revocation it kept presenting the locked certificate until expiry (up to the
+30-day cap), even after a new login. Now every logout handled by tshd (Connect
+logout, forgetting a cluster, or an external `tsh logout` noticed by Connect)
+drops that profile's cached app keys. The next connection to each app reissues
+a certificate with the current credentials, which prompts for login while
+logged out; a cached certificate whose key is gone is never reused. Established
+VNet connections are **not** closed locally: for Keycloak logins the
+server-side strict locks terminate them, for other profiles they continue as
+before. A server-side revocation without a Connect logout (IdP logout, group
+removal, disable) still leaves the locked certificate cached: connections fail
+closed until the user logs out and in again in Connect, restarts VNet, or the
+certificate expires.
+
+Only a Teleport Connect build from this fork contains these tshd/VNet changes;
+`build.assets/cooplay/full-build.sh` builds `teleport`, `tsh` and `tctl` only.
+Vendor Connect binaries keep the old behavior. `tsh vnet` gets the VNet
+reissue fix but has no logout hook: stop it before `tsh logout`.
+
+### Local test evidence (2026-10-25)
+
+On macOS ARM64 with Go 1.25.14: `bash build.assets/cooplay/keycloak.sh test`
+(which now also runs the Connect logout and VNet tests) passed; all 34
+top-level `TestKeycloak*` tests in `lib/auth` passed with and without `-race`;
+full `lib/vnet/...` and `lib/teleterm/...` packages passed; the Connect logout
+and VNet credential tests passed with `-race`. In the pinned Linux ARM64 UI
+builder (Node 24.20.0) the Jest suites for the Connect cluster store, cluster
+lifecycle manager and logout cleanup passed, and `oxfmt`/`oxlint` reported no
+issues in the changed files. This is local evidence, not a hosted CI run or a
+runtime test against real Keycloak, VNet and Coder.
+
+### Runtime verification still required
+
+Unit and auth-server tests do not prove the following; verify them with real
+Keycloak, Proxy, app agent, Coder and employee devices before relying on them:
+
+- Termination of established TCP and WebSocket (Coder UI, DERP relay, `coder`
+  CLI) connections through VNet after Connect logout, back-channel logout, group
+  removal and account disable, including lock propagation time to the app agent,
+  and Coder's reconnection behavior afterwards.
+- Behavior at the login deadline: certificate expiry, VNet reissue and Connect
+  re-login prompts, without extending the original login.
+- The Connect logout dialog text and VNet re-login prompt on macOS/Windows with
+  the fork-built Connect, including the privileged VNet daemon/service version.
+- VNet's default IPv4 range is `100.64.0.0/10`, the same as Headscale's
+  default. Inventory existing routes, set the cluster `vnet_config`
+  `ipv4_cidr_range` to an unused range, and verify IPv4/IPv6 resolution and
+  routing for both VNet and Headscale on the same device.
+- That no other application carries the `cooplay.dev/app=coder` label.
 
 ## Durability and audit
 
@@ -230,7 +358,8 @@ python3 build.assets/cooplay/real-keycloak-smoke.py
 ```
 
 `full-build.sh` builds normal embedded UI and `teleport`, `tsh`, `tctl`
-for native macOS ARM64 and pinned Linux ARM64 / AMD64. Deployment helpers
+for native macOS ARM64 and pinned Linux ARM64 / AMD64. It does not build
+Teleport Connect. Deployment helpers
 are built and versioned independently in the private platform repository.
 Linux includes the upstream embedded session helper. The `ui`, `native`, `linux` (ARM64) and
 `linux-amd64` targets may be invoked separately. Each output directory has a manifest
@@ -258,7 +387,7 @@ real employees/devices, validate Mac launchd/OS accounts/recording, remove old S
 keys/shared kubeconfigs through their owners, and perform joint access/revocation/
 recovery acceptance with Headscale. No production deployment is authorized here.
 
-If a required capability exceeds this strict SSH/Kubernetes, single-Auth contract,
+If a required capability exceeds this strict SSH/Kubernetes/Coder-app, single-Auth contract,
 keep the gate closed. Alternatives include a supported licensed native OIDC
 service with separately verified revocation or another maintained access gateway.
 Do not restore functionality by broad SSH, shared cluster-admin or entitlement flags.

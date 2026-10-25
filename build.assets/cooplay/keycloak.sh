@@ -19,6 +19,9 @@ case "${1:-test}" in
     go test -mod=readonly -count=1 ./lib/cooplay/secrets
     go test -mod=readonly -count=1 -timeout=15m ./lib/auth ./lib/web ./lib/srv \
       -run 'TestKeycloak|TestGenerateUserCertWithLocks|TestUpsertDeleteLockEventsEmitted|TestCloseConnectionsOnLogout|TestApplicationWebSessionsDeletedAfterLogout|TestConnectionMonitorLockInForce|TestMonitorLockInForce|TestMonitorStaleLocks|TestMonitorDisconnectExpiredCertBeforeTimeNow|TestWebSessionWithoutAccessRequest|TestWebSessionMultiAccessRequests|TestWebSessionWithApprovedAccessRequestAndSwitchback|TestExtendWebSessionWithReloadUser|TestExtendWebSessionWithMaxDuration|TestGenerateUserCertsWithRoleRequest'
+    # Teleport Connect logout parity and VNet app credential invalidation.
+    go test -mod=readonly -count=1 -timeout=15m ./lib/teleterm/clusters ./lib/teleterm/daemon ./lib/vnet \
+      -run 'TestLogoutRevokesKeycloakLoginBeforeDeletingKeys|TestIsKeycloakRevocationNotConfirmed|TestClusterLogoutKeycloakRevocationNotConfirmed|TestForgetProfileCredentials|TestDialFakeApp|TestOnNewAppConnection'
     ;;
   build)
     # Deliberately a CLI/local-evaluation profile: no bundled UI, Touch ID,
