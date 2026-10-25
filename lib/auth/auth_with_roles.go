@@ -6946,8 +6946,16 @@ func (a *ServerWithRoles) CreateAppSession(ctx context.Context, req *proto.Creat
 		return nil, trace.Wrap(err)
 	}
 
-	session, err := a.authServer.CreateAppSession(ctx, req, a.context.Identity.GetIdentity(), a.context.Checker)
+	identity := a.context.Identity.GetIdentity()
+	keycloakExpires, err := a.keycloakAppSessionDeadline(ctx, &identity)
 	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	session, err := a.authServer.CreateAppSession(ctx, req, identity, a.context.Checker)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if err := a.keycloakCheckAppSession(ctx, session, keycloakExpires); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
