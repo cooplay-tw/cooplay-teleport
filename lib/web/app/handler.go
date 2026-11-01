@@ -232,6 +232,17 @@ func (h *Handler) HandleConnection(ctx context.Context, clientConn net.Conn) err
 
 	serverConn = tls.Client(serverConn, session.tr.clientTLSConfig)
 
+	ctx, stop := monitorAppStream(ctx, appStreamCheckInterval, func(ctx context.Context) error {
+		_, err := h.getAppSessionFromAccessPoint(ctx, ws.GetName())
+		if err != nil {
+			h.logger.InfoContext(ctx, "Closing active application tunnel after session authorization ended")
+		}
+		return err
+	})
+	defer stop()
+	// Explicit closure also covers protocols that have hijacked the connection.
+	stopClose := context.AfterFunc(ctx, func() { _ = clientConn.Close(); _ = serverConn.Close() })
+	defer stopClose()
 	err = utils.ProxyConn(ctx, clientConn, serverConn)
 	if err != nil {
 		return trace.Wrap(err)

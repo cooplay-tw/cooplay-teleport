@@ -70,7 +70,15 @@ func (h *Handler) withAuth(handler handlerAuthFunc) http.HandlerFunc {
 			}
 			return trace.Wrap(err)
 		}
-		if err := handler(w, r, session); err != nil {
+		ctx, stop := monitorAppStream(r.Context(), appStreamCheckInterval, func(ctx context.Context) error {
+			_, err := h.authenticate(ctx, r.WithContext(ctx))
+			if err != nil {
+				h.logger.InfoContext(ctx, "Closing active application request after session authorization ended")
+			}
+			return err
+		})
+		defer stop()
+		if err := handler(w, r.WithContext(ctx), session); err != nil {
 			return trace.Wrap(err)
 		}
 		return nil
