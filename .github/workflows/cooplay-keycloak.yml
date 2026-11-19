@@ -76,3 +76,63 @@ jobs:
             build/cooplay-candidate/linux-arm64/manifest.json
             build/cooplay-candidate/real-keycloak-result.json
           retention-days: 14
+  # Manual release inputs: the bundled UI is built on arm64 like the candidate
+  # job, then the Linux amd64 binaries are built natively in the pinned amd64
+  # buildbox. The artifact is the exact install.py stage input (manifest.json
+  # plus teleport, tsh, tctl); publishing a release stays a separate step.
+  release-ui:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with: {go-version: '1.25.14', cache: true}
+      - name: Use task-local caches
+        run: |
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+      - run: bash build.assets/cooplay/full-build.sh ui
+      - run: tar -C webassets -czf /tmp/webassets-teleport.tar.gz teleport
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-webassets
+          path: /tmp/webassets-teleport.tar.gz
+          retention-days: 3
+  release-linux-amd64:
+    if: github.event_name == 'workflow_dispatch'
+    needs: release-ui
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with: {go-version: '1.25.14', cache: true}
+      - name: Use task-local caches
+        run: |
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with: {name: release-webassets, path: /tmp/release-webassets}
+      - run: tar -C webassets -xzf /tmp/release-webassets/webassets-teleport.tar.gz
+      - run: bash build.assets/cooplay/full-build.sh linux-amd64
+      - name: Check the manifest is clean and complete
+        run: |
+          python3 - <<'PY'
+          import json
+          m = json.load(open('build/cooplay-candidate/linux-amd64/manifest.json'))
+          assert not m['dirty'], 'dirty build'
+          assert m['profile'] == 'full-ui-keycloak-candidate' and m['webassets']
+          assert m['go_environment']['GOOS'] == 'linux' and m['go_environment']['GOARCH'] == 'amd64'
+          assert set(m['artifacts']) == {'teleport', 'tsh', 'tctl'}
+          print(m['fork_revision'])
+          PY
+          sha256sum build/cooplay-candidate/linux-amd64/manifest.json
+      - run: git diff --exit-code && git diff --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-linux-amd64
+          path: build/cooplay-candidate/linux-amd64/
+          retention-days: 14
