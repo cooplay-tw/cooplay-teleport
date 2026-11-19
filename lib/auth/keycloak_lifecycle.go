@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/rand/v2"
 	"net/http"
@@ -150,13 +151,15 @@ func NewManagedKeycloakService(a *Server, cfg KeycloakLifecycleConfig) (OIDCServ
 	// Synchronously fence every connector before Auth can expose listeners.
 	// Never inherit a successful health timestamp from a previous process/backup.
 	for name := range cfg.Connectors {
-		if err := svc.ensureLock(a.CloseContext(), "keycloak-health-"+keycloakDigest(name), types.LockTarget{Role: keycloakGuard(name)}, "startup-reconciliation-required"); err != nil {
+		if err := svc.ensureLock(a.CloseContext(), keycloakHealthLockName(name), types.LockTarget{Role: keycloakGuard(name)}, "startup-reconciliation-required"); err != nil {
 			return nil, err
 		}
+		keycloakHealthLockActive.WithLabelValues(name).Set(1)
 		if err := a.bk.Delete(a.CloseContext(), keycloakLifecycleKey("health", name)); err != nil && !trace.IsNotFound(err) {
 			return nil, err
 		}
 		keycloakLastSync.WithLabelValues(name).Set(0)
+		svc.exportHealthLockEvents(a.CloseContext(), name)
 	}
 	return svc, nil
 }
@@ -440,6 +443,21 @@ func ReconcileKeycloak(ctx context.Context, svc OIDCService) error {
 func (s *keycloakService) reconcile(ctx context.Context) (resultErr error) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	start := time.Now()
+	type connectorFailure struct {
+		name string
+		last time.Time
+		err  *keycloakSyncFailure
+	}
+	var failures []connectorFailure
+	defer func() {
+		elapsed := time.Since(start)
+		keycloakSyncPassDuration.Observe(elapsed.Seconds())
+		for _, failure := range failures {
+			s.reportKeycloakSyncFailure(ctx, failure.name, failure.err, elapsed, failure.last)
+		}
+	}()
+	var replayFailure *keycloakSyncFailure
 	defer func() {
 		if resultErr == nil {
 			return
@@ -448,15 +466,25 @@ func (s *keycloakService) reconcile(ctx context.Context) (resultErr error) {
 		repair, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		for name := range s.lifecycle.Connectors {
-			if s.checkHealth(repair, name) != nil {
-				if err := s.ensureLock(repair, "keycloak-health-"+keycloakDigest(name), types.LockTarget{Role: keycloakGuard(name)}, "synchronization-unavailable"); err != nil {
-					s.a.logger.ErrorContext(repair, "Keycloak fail-closed lock could not be persisted")
+			last := s.lastKeycloakHealth(repair, name)
+			if s.keycloakHealthStale(last) {
+				if err := s.lockUnhealthyConnector(repair, name); err != nil {
+					s.a.logger.ErrorContext(repair, "Keycloak fail-closed lock could not be persisted", "connector", name)
 				}
+			}
+			if replayFailure != nil {
+				failures = append(failures, connectorFailure{name, last, replayFailure})
 			}
 		}
 	}()
 	var first error
 	if err := s.replayJournal(ctx); err != nil {
+		if !errors.As(err, &replayFailure) {
+			replayFailure = &keycloakSyncFailure{step: "journal_replay", kind: "other"}
+			if trace.IsBadParameter(err) {
+				replayFailure.kind = "decode"
+			}
+		}
 		return err
 	}
 	// Replay all durable revocations, including accounts whose short-lived user
@@ -464,10 +492,12 @@ func (s *keycloakService) reconcile(ctx context.Context) (resultErr error) {
 	prefix := keycloakLifecycleKey("revocations")
 	for item, err := range s.a.bk.Items(ctx, backend.ItemsParams{StartKey: prefix, EndKey: backend.RangeEnd(prefix)}) {
 		if err != nil {
+			replayFailure = &keycloakSyncFailure{step: "revocation_replay", kind: "backend"}
 			return trace.Wrap(err)
 		}
 		var r keycloakRevocation
 		if json.Unmarshal(item.Value, &r) != nil {
+			replayFailure = &keycloakSyncFailure{step: "revocation_replay", kind: "decode"}
 			return trace.BadParameter("corrupt Keycloak revocation record")
 		}
 		kind, id := "users", r.Target.User
@@ -478,18 +508,21 @@ func (s *keycloakService) reconcile(ctx context.Context) (resultErr error) {
 			continue
 		}
 		if err := s.ensureLock(ctx, "keycloak-revoke-"+keycloakDigest(kind+"\x00"+id), r.Target, r.Reason, r.Expires); err != nil {
+			replayFailure = &keycloakSyncFailure{step: "revocation_replay", kind: "backend"}
 			return err
 		}
 	}
 	for name := range s.lifecycle.Connectors {
 		checked := map[string]keycloakAccountState{}
 		// Probe private Admin reachability/authorization even with zero logins.
-		get, cancel, err := s.adminReader(ctx, name)
+		get, cancel, err := s.adminReader(ctx, name, true)
 		if err == nil {
 			var count *int
-			status, probeErr := get(s.lifecycle.Connectors[name].AdminURL+"/users/count", &count)
-			if probeErr != nil || status != http.StatusOK || count == nil || *count < 0 {
-				err = trace.AccessDenied("Keycloak synchronization probe failed")
+			probe, probeErr := get("probe", s.lifecycle.Connectors[name].AdminURL+"/users/count", &count)
+			if probeErr != nil {
+				err = probeErr
+			} else if count == nil || *count < 0 {
+				err = probe.failure("probe", "decode")
 			}
 		}
 		if err == nil {
@@ -522,25 +555,26 @@ func (s *keycloakService) reconcile(ctx context.Context) (resultErr error) {
 					}
 				}
 				if !enabled {
-					return s.persistRevocation(ctx, "users", login.Username, types.LockTarget{User: login.Username}, "account-disabled", time.Time{})
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "users", login.Username, types.LockTarget{User: login.Username}, "account-disabled", time.Time{}))
 				}
 				if reason != "" {
 					// Retire this credential generation without blocking a fresh
 					// login using the user's remaining authoritative memberships.
-					return s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, reason, login.Expires.Add(24*time.Hour))
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, reason, login.Expires.Add(24*time.Hour)))
 				}
 				if !slices.Contains(account.sessions, login.SID) {
-					return s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, "idp-session-ended", login.Expires.Add(24*time.Hour))
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, "idp-session-ended", login.Expires.Add(24*time.Hour)))
 				}
 				if err := s.checkLoginRevocations(ctx, &login); err != nil {
-					return s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, "logout", login.Expires.Add(24*time.Hour))
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, "logout", login.Expires.Add(24*time.Hour)))
 				}
 				return nil
 			})
 		}
 		cancel()
 		health := keycloakLifecycleKey("health", name)
-		guardLock := "keycloak-health-" + keycloakDigest(name)
+		guardLock := keycloakHealthLockName(name)
+		var last time.Time
 		if err == nil {
 			err = s.lifecyclePut(ctx, health, s.a.clock.Now(), time.Time{}, false)
 			if err == nil {
@@ -548,27 +582,34 @@ func (s *keycloakService) reconcile(ctx context.Context) (resultErr error) {
 				if trace.IsNotFound(err) {
 					err = nil
 				}
+				err = keycloakSyncBackendFailure("backend", err)
+			} else {
+				err = keycloakSyncBackendFailure("health_write", err)
 			}
 			if err == nil {
+				keycloakHealthLockActive.WithLabelValues(name).Set(0)
 				keycloakLastSync.WithLabelValues(name).Set(float64(s.a.clock.Now().Unix()))
 				_ = s.a.DeleteClusterAlert(ctx, guardLock)
+			} else {
+				last = s.lastKeycloakHealth(ctx, name)
 			}
 		} else {
-			item, getErr := s.a.bk.Get(ctx, health)
-			var last time.Time
-			if getErr == nil {
-				_ = json.Unmarshal(item.Value, &last)
-			}
-			if last.IsZero() || s.a.clock.Now().Sub(last) > time.Duration(s.lifecycle.MaxStaleSeconds)*time.Second {
-				_ = s.ensureLock(ctx, guardLock, types.LockTarget{Role: keycloakGuard(name)}, "synchronization-unavailable")
+			last = s.lastKeycloakHealth(ctx, name)
+			if s.keycloakHealthStale(last) {
+				_ = s.lockUnhealthyConnector(ctx, name)
 			}
 			alert, alertErr := types.NewClusterAlert(guardLock, "Keycloak synchronization failed; inspect Auth logs and identity connectivity. Access fails closed after the configured staleness limit.", types.WithAlertSeverity(types.AlertSeverity_HIGH), types.WithAlertLabel(types.AlertOnLogin, "yes"))
 			if alertErr == nil {
 				_ = s.a.UpsertClusterAlert(ctx, alert)
 			}
 		}
-		if err != nil && first == nil {
-			first = trace.ConnectionProblem(nil, "Keycloak reconciliation failed")
+		if err != nil {
+			failure := &keycloakSyncFailure{step: "backend", kind: "backend"}
+			errors.As(err, &failure)
+			failures = append(failures, connectorFailure{name, last, failure})
+			if first == nil {
+				first = trace.ConnectionProblem(nil, "Keycloak reconciliation failed")
+			}
 		}
 	}
 	return first
@@ -584,9 +625,7 @@ func (s *keycloakService) runLifecycle(ctx context.Context) {
 		case <-delay.C:
 		}
 		pass, cancel := context.WithTimeout(ctx, time.Duration(s.lifecycle.MaxStaleSeconds)*time.Second)
-		if err := s.reconcile(pass); err != nil && ctx.Err() == nil {
-			s.a.logger.ErrorContext(ctx, "Keycloak reconciliation failed; persistent revocations retained")
-		}
+		_ = s.reconcile(pass)
 		cancel()
 		// Retry on the next bounded pass, with jitter to avoid synchronized
 		// Admin API bursts when several Auth instances restart together.
@@ -597,17 +636,24 @@ func (s *keycloakService) runLifecycle(ctx context.Context) {
 
 // adminReader obtains a short-lived service token using the public issuer, but
 // sends it only to the explicitly configured private Admin origin. No redirects.
-type keycloakAdminRead func(string, any) (int, error)
+type keycloakAdminRead func(step, endpoint string, out any) (keycloakAdminResponse, *keycloakSyncFailure)
 type keycloakAccountState struct {
 	groups   []string
 	sessions []string
 	enabled  bool
 }
 
-func (s *keycloakService) adminReader(ctx context.Context, connector string) (keycloakAdminRead, context.CancelFunc, error) {
+func (s *keycloakService) adminReader(ctx context.Context, connector string, retry bool) (keycloakAdminRead, context.CancelFunc, error) {
+	passDeadline, hasPassDeadline := ctx.Deadline()
 	ctx, cancel := s.httpContext(ctx)
+	if !hasPassDeadline {
+		passDeadline, _ = ctx.Deadline()
+	}
+	if !retry {
+		passDeadline = time.Time{}
+	}
 	fail := func() (keycloakAdminRead, context.CancelFunc, error) {
-		return nil, cancel, trace.AccessDenied("Keycloak synchronization authentication unavailable")
+		return nil, cancel, &keycloakSyncFailure{step: "token", kind: "other"}
 	}
 	cfg, ok := s.lifecycle.Connectors[connector]
 	if !ok {
@@ -627,27 +673,31 @@ func (s *keycloakService) adminReader(ctx context.Context, connector string) (ke
 	var token struct {
 		AccessToken string `json:"access_token"`
 	}
-	status, err := keycloakAdminJSON(client, req, &token)
-	if err != nil || status != http.StatusOK || token.AccessToken == "" {
-		return fail()
+	response, failure := keycloakReconcileAdminJSON(client, req, connector, "token", &token, passDeadline)
+	if failure != nil {
+		return nil, cancel, failure
 	}
-	get := func(endpoint string, out any) (int, error) {
+	if token.AccessToken == "" {
+		return nil, cancel, response.failure("token", "decode")
+	}
+	get := func(step, endpoint string, out any) (keycloakAdminResponse, *keycloakSyncFailure) {
+		var response keycloakAdminResponse
 		// Internal callers use fixed suffixes; keep the credential boundary explicit.
 		if !strings.HasPrefix(endpoint, cfg.AdminURL+"/users/") {
-			return 0, trace.AccessDenied("invalid Keycloak Admin path")
+			return response, response.failure(step, "other")
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
-			return 0, trace.AccessDenied("invalid Keycloak Admin request")
+			return response, response.failure(step, "other")
 		}
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-		return keycloakAdminJSON(client, req, out)
+		return keycloakReconcileAdminJSON(client, req, connector, step, out, passDeadline)
 	}
 	return get, cancel, nil
 }
 
 func (s *keycloakService) adminUser(ctx context.Context, connector, subject string) (keycloakAccountState, error) {
-	get, cancel, err := s.adminReader(ctx, connector)
+	get, cancel, err := s.adminReader(ctx, connector, false)
 	defer cancel()
 	if err != nil {
 		return keycloakAccountState{}, err
@@ -660,19 +710,22 @@ func (s *keycloakService) adminUser(ctx context.Context, connector, subject stri
 func readKeycloakAccount(get keycloakAdminRead, cfg KeycloakLifecycleConnector, subject string) (keycloakAccountState, error) {
 	var result keycloakAccountState
 	if subject == "" || len(subject) > 512 || strings.ContainsAny(subject, "/\\?#%") || subject == "." || subject == ".." {
-		return result, trace.AccessDenied("invalid Keycloak subject")
+		return result, &keycloakSyncFailure{step: "account_user", kind: "other"}
 	}
 	base := cfg.AdminURL + "/users/" + url.PathEscape(subject)
 	var user struct {
 		ID      string `json:"id"`
 		Enabled bool   `json:"enabled"`
 	}
-	status, err := get(base, &user)
-	if err == nil && status == 404 {
+	response, failure := get("account_user", base, &user)
+	if failure != nil {
+		return result, failure
+	}
+	if response.status == http.StatusNotFound {
 		return result, nil
 	}
-	if err != nil || status != 200 || user.ID != subject {
-		return result, trace.AccessDenied("Keycloak account query failed")
+	if user.ID != subject {
+		return result, response.failure("account_user", "decode")
 	}
 	if !user.Enabled {
 		return result, nil
@@ -683,13 +736,16 @@ func readKeycloakAccount(get keycloakAdminRead, cfg KeycloakLifecycleConnector, 
 		UserID  string            `json:"userId"`
 		Clients map[string]string `json:"clients"`
 	}
-	status, err = get(base+"/sessions", &sessions)
-	if err != nil || status != 200 || sessions == nil {
-		return result, trace.AccessDenied("Keycloak session query failed")
+	response, failure = get("account_sessions", base+"/sessions", &sessions)
+	if failure != nil {
+		return result, failure
+	}
+	if sessions == nil {
+		return result, response.failure("account_sessions", "decode")
 	}
 	for _, session := range sessions {
 		if session.ID == "" || session.UserID != subject || session.Clients == nil {
-			return result, trace.AccessDenied("invalid Keycloak session")
+			return result, response.failure("account_sessions", "decode")
 		}
 		for _, client := range session.Clients {
 			if client == cfg.ClientID {
@@ -702,13 +758,16 @@ func readKeycloakAccount(get keycloakAdminRead, cfg KeycloakLifecycleConnector, 
 		var page []struct {
 			Path string `json:"path"`
 		}
-		status, err = get(base+"/groups?briefRepresentation=true&first="+strconv.Itoa(first)+"&max=100", &page)
-		if err != nil || status != 200 || page == nil {
-			return result, trace.AccessDenied("Keycloak group query failed")
+		response, failure = get("account_groups", base+"/groups?briefRepresentation=true&first="+strconv.Itoa(first)+"&max=100", &page)
+		if failure != nil {
+			return result, failure
+		}
+		if page == nil {
+			return result, response.failure("account_groups", "decode")
 		}
 		for _, g := range page {
 			if g.Path == "" {
-				return result, trace.AccessDenied("Keycloak group path unavailable")
+				return result, response.failure("account_groups", "decode")
 			}
 			result.groups = append(result.groups, g.Path)
 		}
@@ -716,24 +775,7 @@ func readKeycloakAccount(get keycloakAdminRead, cfg KeycloakLifecycleConnector, 
 			return result, nil
 		}
 	}
-	return result, trace.AccessDenied("Keycloak group query limit exceeded")
-}
-
-func keycloakAdminJSON(client *http.Client, req *http.Request, out any) (int, error) {
-	response, err := client.Do(req)
-	if err != nil {
-		return 0, trace.ConnectionProblem(nil, "Keycloak request failed")
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 200 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024))
-		return response.StatusCode, nil
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, 1024*1024+1))
-	if err != nil || len(data) > 1024*1024 || json.Unmarshal(data, out) != nil {
-		return response.StatusCode, trace.BadParameter("invalid Keycloak response")
-	}
-	return response.StatusCode, nil
+	return result, response.failure("account_groups", "decode")
 }
 
 func keycloakRoleSpecEqual(a, b types.RoleSpecV6) bool {
@@ -751,7 +793,7 @@ func (s *keycloakService) checkHealth(ctx context.Context, connector string) err
 		return trace.AccessDenied("Keycloak reconciliation has not completed")
 	}
 	var last time.Time
-	if json.Unmarshal(item.Value, &last) != nil || last.IsZero() || s.a.clock.Now().Sub(last) > time.Duration(s.lifecycle.MaxStaleSeconds)*time.Second {
+	if json.Unmarshal(item.Value, &last) != nil || s.keycloakHealthStale(last) {
 		return trace.AccessDenied("Keycloak reconciliation is stale")
 	}
 	return nil

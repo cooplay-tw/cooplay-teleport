@@ -309,7 +309,7 @@ func keycloakHTTPContext(ctx context.Context) (context.Context, context.CancelFu
 	if supplied, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok {
 		client.Transport = supplied.Transport
 	}
-	client.Timeout = 10 * time.Second
+	client.Timeout = keycloakHTTPRequestTimeout
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	return oidc.ClientContext(ctx, &client), cancel

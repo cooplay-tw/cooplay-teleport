@@ -199,11 +199,37 @@ provides bounded recovery when the notification path fails. The
 [OIDC back-channel specification](https://openid.net/specs/openid-connect-backchannel-1_0.html)
 is the notification contract.
 
-Reconciliation uses only Keycloak `view-users` (including online sessions): no realm-admin, writes or client
-administration. Passes are bounded, retry with jitter, deduplicate subjects, page
-groups completely, and fail closed on partial reads. Metrics expose successful
-sync time, allowed staleness and failures; native high-severity cluster alerts
-report failures. Runtime logs never include raw IdP responses or secrets.
+Reconciliation uses Keycloak `view-users` for read-only queries, including
+online sessions. It deduplicates subjects, reads all group pages, and fails
+closed on partial reads. Passes run at a jittered poll interval. Within a pass,
+the client-credentials POST and Admin GETs each allow one retry for timeout,
+connection, or TLS errors when more than 10 seconds remain in the pass and the
+shared HTTP context is still live. Each request has a 10-second timeout. The
+requests share at most 15 seconds, subject to the outer pass deadline.
+
+Failed passes log an ERROR with `connector`, `step`, `kind`, `http_status`,
+`request_ms`, `pass_ms`, and `since_last_success_s`. HTTP status and request
+duration use zero when unavailable. The last-success age uses -1 before a
+success is recorded. Logs omit identifiers, request URLs, tokens, and response
+bodies. Native high-severity cluster alerts also report failures.
+
+Steps are `journal_replay`, `revocation_replay`, `token`, `probe`,
+`account_user`, `account_sessions`, `account_groups`, `revocation_persist`,
+`health_write`, and `backend`. Kinds are `timeout`, `connect`, `tls`,
+`http_status`, `decode`, `backend`, and `other`.
+
+Four additional metrics cover reconciliation and fencing.
+
+| Metric | What it measures |
+| --- | --- |
+| `teleport_keycloak_sync_step_failures_total{connector,step,kind}` | Failed steps, including a failed request attempt followed by a successful retry. |
+| `teleport_keycloak_sync_pass_seconds` | Histogram of pass duration, including fail-closed repair. |
+| `teleport_keycloak_health_lock_active{connector}` | 1 when the connector is fenced by its health lock, including during startup. |
+| `teleport_keycloak_health_lock_events_total{connector}` | Backend-persisted outage lock creations, exported as a gauge and restored at startup. Startup fences do not count. |
+
+Auth normally records lock creation and the event increment in a single
+backend transaction. If accounting fails, Auth still attempts to fence access
+with the native lock and logs the accounting failure.
 
 New login rejects a stale health timestamp immediately. Existing-connection
 fencing runs at reconciliation boundaries: an in-flight pass can consume up to

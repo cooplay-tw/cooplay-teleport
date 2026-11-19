@@ -210,7 +210,11 @@ func (a *Server) UpsertLock(ctx context.Context, lock types.Lock) error {
 	if err := a.Services.UpsertLock(ctx, lock); err != nil {
 		return trace.Wrap(err)
 	}
+	a.emitLockCreated(ctx, lock)
+	return nil
+}
 
+func (a *Server) emitLockCreated(ctx context.Context, lock types.Lock) {
 	var expiresTime time.Time
 	// leave as 0 if no lock expiration was set
 	if le := lock.LockExpiry(); le != nil {
@@ -235,7 +239,6 @@ func (a *Server) UpsertLock(ctx context.Context, lock types.Lock) error {
 	}); err != nil {
 		a.logger.WarnContext(ctx, "Failed to emit lock create event.", "error", err)
 	}
-	return nil
 }
 
 // DeleteLock deletes a lock and emits a related audit event.
