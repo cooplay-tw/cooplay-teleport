@@ -11,10 +11,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -131,7 +133,7 @@ func ValidateKeycloakConnector(c types.OIDCConnector) error {
 		return trace.BadParameter("unsupported Keycloak connector option")
 	}
 	if _, configured := c.GetMaxAge(); configured {
-		return trace.BadParameter("max_age is unsupported; Keycloak always requests prompt=login")
+		return trace.BadParameter("max_age must be configured in the Auth-local Keycloak lifecycle file")
 	}
 	if concrete.Spec.Prompt != "" && concrete.Spec.Prompt != "login" {
 		return trace.BadParameter("Keycloak requires prompt=login")
@@ -267,7 +269,11 @@ func (s *keycloakService) CreateOIDCAuthRequest(ctx context.Context, req types.O
 	}
 	verifier := oauth2.GenerateVerifier()
 	req.LoginHint = "" // Identity is never bound by an unverified email hint.
-	req.RedirectURL = config.AuthCodeURL(req.StateToken, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier), oauth2.SetAuthURLParam("prompt", "login"))
+	prompt := oauth2.SetAuthURLParam("prompt", "login")
+	if s.lifecycle != nil && s.lifecycle.ReauthMaxAgeSeconds != 0 {
+		prompt = oauth2.SetAuthURLParam("max_age", strconv.Itoa(s.lifecycle.ReauthMaxAgeSeconds))
+	}
+	req.RedirectURL = config.AuthCodeURL(req.StateToken, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier), prompt)
 	fingerprint, err := keycloakFingerprint(c)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -303,7 +309,7 @@ func keycloakHTTPContext(ctx context.Context) (context.Context, context.CancelFu
 	if supplied, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok {
 		client.Transport = supplied.Transport
 	}
-	client.Timeout = 10 * time.Second
+	client.Timeout = keycloakHTTPRequestTimeout
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	return oidc.ClientContext(ctx, &client), cancel
@@ -407,9 +413,17 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 	if err != nil {
 		return nil, err
 	}
+	exchangeStart := s.a.clock.Now()
 	token, err := config.Exchange(httpCtx, q.Get("code"), oauth2.VerifierOption(stored.Verifier))
 	if err != nil {
 		return nil, trace.AccessDenied("Keycloak code exchange failed")
+	}
+	var sessionCap time.Time
+	if remaining := keycloakRefreshLifetime(token.Extra("refresh_expires_in")); remaining > 0 {
+		sessionCap = exchangeStart.Add(remaining)
+	} else if s.lifecycle != nil {
+		s.a.logger.WarnContext(ctx, "Keycloak token response has missing or invalid refresh_expires_in", "connector", c.GetName())
+		return nil, trace.AccessDenied("invalid Keycloak session lifetime")
 	}
 	raw, ok := token.Extra("id_token").(string)
 	if !ok || len(raw) > 64*1024 {
@@ -421,6 +435,18 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 	}
 	if id.Issuer != c.GetIssuerURL() || subtle.ConstantTimeCompare([]byte(id.Nonce), []byte(stored.Nonce)) != 1 || id.Subject == "" || len(id.Subject) > 512 || strings.ContainsRune(id.Subject, 0) || id.IssuedAt.IsZero() || id.IssuedAt.After(s.a.clock.Now().Add(30*time.Second)) {
 		return nil, trace.AccessDenied("invalid Keycloak identity binding")
+	}
+	if s.lifecycle != nil && s.lifecycle.ReauthMaxAgeSeconds != 0 {
+		var claims struct {
+			AuthTime *int64 `json:"auth_time"`
+		}
+		now := s.a.clock.Now()
+		oldest := now.Add(-time.Duration(s.lifecycle.ReauthMaxAgeSeconds+30) * time.Second)
+		if id.Claims(&claims) != nil || claims.AuthTime == nil || *claims.AuthTime < oldest.Unix() ||
+			*claims.AuthTime > now.Add(30*time.Second).Unix() || time.Unix(*claims.AuthTime, 0).Before(oldest) {
+			s.a.logger.WarnContext(ctx, "Keycloak ID token has missing, invalid or out-of-window auth_time", "connector", c.GetName())
+			return nil, trace.AccessDenied("invalid Keycloak authentication time")
+		}
 	}
 	var claims struct {
 		Groups          []string `json:"groups"`
@@ -483,6 +509,13 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 		return nil, trace.AccessDenied("Keycloak login-state augmentation is unsupported")
 	}
 	expires := now.Add(ttl)
+	if !sessionCap.IsZero() && sessionCap.Before(expires) {
+		expires = sessionCap
+	}
+	if !sessionCap.IsZero() && expires.Sub(s.a.clock.Now()) < apidefaults.MinCertDuration {
+		s.a.logger.WarnContext(ctx, "Keycloak session expires too soon", "connector", c.GetName())
+		return nil, trace.AccessDenied("Keycloak session expires too soon")
+	}
 	login, err := s.prepareLogin(ctx, c, id.Subject, claims.SID, username, claims.Groups, expires)
 	if err != nil {
 		return nil, err
@@ -505,6 +538,31 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 		return nil, err
 	}
 	return response, nil
+}
+
+func keycloakRefreshLifetime(extra any) time.Duration {
+	// oauth2 decodes JSON extras as float64 or strings. Form-encoded
+	// integer extras are normalized to int64 by Token.Extra.
+	var seconds float64
+	switch value := extra.(type) {
+	case float64:
+		seconds = value
+	case int64:
+		seconds = float64(value)
+	case string:
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return 0
+		}
+		seconds = float64(parsed)
+	default:
+		return 0
+	}
+	const maxSeconds = 400 * 24 * 60 * 60
+	if !(seconds > 0 && seconds <= maxSeconds) || seconds != math.Trunc(seconds) {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func validateKeycloakRole(role types.Role) error {

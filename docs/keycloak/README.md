@@ -68,14 +68,16 @@ accept only authenticated native Proxy identities.
   See [SSH example](../../examples/keycloak/role.yaml),
   [Kubernetes example](../../examples/keycloak/kubernetes-role.yaml) and
   [Coder example](../../examples/keycloak/coder-app-role.yaml).
-- Teleport signs the normal SSH/TLS credentials. Lifetime is the minimum of
-  requested TTL, role TTL and the Auth-local session cap. The default also caps
+- Teleport signs the normal SSH/TLS credentials. Lifetime is bounded by the
+  requested TTL, role TTL, Auth-local session cap and the Keycloak session
+  deadline. The default also caps
   the session at the ID-token remaining lifetime. With an explicit managed cap
   above five minutes, a freshly validated ID token authenticates the exchange;
   its later expiry is independent of the bounded Teleport session. Expired or
   insufficiently valid ID tokens still fail login. Native reissue and web renewal
-  preserve the original deadline and role generation. No refresh/offline tokens
-  are retained; IdP online sessions continue to govern revocation.
+  preserve the original deadline and role generation. Application sessions
+  also stay within the login deadline. IdP online sessions continue to govern
+  revocation.
 - Every login carries two extra **zero-grant** roles: a unique login marker and
   a connector health marker. Native locks target these markers without adding
   resource privileges. The stored user's roles remain the actual mapped roles.
@@ -118,9 +120,25 @@ that rejects this field until the old settings and bounded-session contract have
 been restored. Outstanding longer credentials must remain fenced by locks and
 their original deadlines; do not erase journals to roll back.
 
-IdP SSO/client session idle and maximum durations are independent upper bounds:
-if Keycloak expires the online client session, reconciliation revokes Teleport
-even before this cap. This setting does not refresh or prolong a Keycloak session.
+Keep refresh-token issuance enabled for the Teleport client in Keycloak.
+Managed CLI and web login require a positive integer `refresh_expires_in`
+of at most 400 days in the authorization-code exchange response. Auth adds the
+reported lifetime to the exchange start time and uses that deadline to cap
+credentials. A missing or invalid value, or insufficient remaining lifetime,
+rejects login. Auth retains no refresh or offline tokens. If Keycloak ends an
+online client session early, reconciliation still revokes the associated logins.
+
+Optional Auth-local `reauth_max_age_seconds` defaults to 0, which sends
+`prompt=login` and leaves `auth_time` optional. Values from 30 through 600
+send OIDC `max_age` instead. Auth then requires an integer ID-token
+`auth_time` no older than the configured window plus 30 seconds and no more
+than 30 seconds in the future. Enable the Keycloak `basic` scope or an
+equivalent mapper for the Teleport client before enabling this setting.
+Keycloak can reuse authentication from another client in the same browser
+SSO session. Verify that the realm requires OTP on all applicable login paths
+before allowing reuse. Connector resources still reject `max_age`.
+Configuration changes require an Auth restart. When reverting to an older
+binary, restore the previous `lifecycle.json` at the same time.
 Set deployment-specific SSH idle time separately; no company defaults are baked
 into this public fork.
 
@@ -181,11 +199,37 @@ provides bounded recovery when the notification path fails. The
 [OIDC back-channel specification](https://openid.net/specs/openid-connect-backchannel-1_0.html)
 is the notification contract.
 
-Reconciliation uses only Keycloak `view-users` (including online sessions): no realm-admin, writes or client
-administration. Passes are bounded, retry with jitter, deduplicate subjects, page
-groups completely, and fail closed on partial reads. Metrics expose successful
-sync time, allowed staleness and failures; native high-severity cluster alerts
-report failures. Runtime logs never include raw IdP responses or secrets.
+Reconciliation uses Keycloak `view-users` for read-only queries, including
+online sessions. It deduplicates subjects, reads all group pages, and fails
+closed on partial reads. Passes run at a jittered poll interval. Within a pass,
+the client-credentials POST and Admin GETs each allow one retry for timeout,
+connection, or TLS errors when more than 10 seconds remain in the pass and the
+shared HTTP context is still live. Each request has a 10-second timeout. The
+requests share at most 15 seconds, subject to the outer pass deadline.
+
+Failed passes log an ERROR with `connector`, `step`, `kind`, `http_status`,
+`request_ms`, `pass_ms`, and `since_last_success_s`. HTTP status and request
+duration use zero when unavailable. The last-success age uses -1 before a
+success is recorded. Logs omit identifiers, request URLs, tokens, and response
+bodies. Native high-severity cluster alerts also report failures.
+
+Steps are `journal_replay`, `revocation_replay`, `token`, `probe`,
+`account_user`, `account_sessions`, `account_groups`, `revocation_persist`,
+`health_write`, and `backend`. Kinds are `timeout`, `connect`, `tls`,
+`http_status`, `decode`, `backend`, and `other`.
+
+Four additional metrics cover reconciliation and fencing.
+
+| Metric | What it measures |
+| --- | --- |
+| `teleport_keycloak_sync_step_failures_total{connector,step,kind}` | Failed steps, including a failed request attempt followed by a successful retry. |
+| `teleport_keycloak_sync_pass_seconds` | Histogram of pass duration, including fail-closed repair. |
+| `teleport_keycloak_health_lock_active{connector}` | 1 when the connector is fenced by its health lock, including during startup. |
+| `teleport_keycloak_health_lock_events_total{connector}` | Backend-persisted outage lock creations, exported as a gauge and restored at startup. Startup fences do not count. |
+
+Auth normally records lock creation and the event increment in a single
+backend transaction. If accounting fails, Auth still attempts to fence access
+with the native lock and logs the accounting failure.
 
 New login rejects a stale health timestamp immediately. Existing-connection
 fencing runs at reconciliation boundaries: an in-flight pass can consume up to

@@ -58,6 +58,11 @@ an old database does **not** revoke issued certificates. The unmodified upstream
 has no Keycloak connector or custom journal replayer. Its native locks still
 work, but do not assume a restored database contains the latest ones.
 
+Restore the previous `lifecycle.json` together with an older fork binary.
+Its strict decoder rejects unknown fields such as `reauth_max_age_seconds`,
+even when set to zero. Capped logins use the existing expiry field in the
+backend record. Keep current revocation journals and locks during rollback.
+
 For a rollback that removes this connector:
 
 1. Close the affected ingress and stop all credential issuers. Preserve current

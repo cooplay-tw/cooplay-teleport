@@ -97,7 +97,7 @@ func itemsFromResource(resource types.Resource) ([]backend.Item, error) {
 	case types.ProvisionToken:
 		item, err = itemFromProvisionToken(r)
 	case types.Lock:
-		item, err = itemFromLock(r)
+		item, err = LockItem(r)
 	case types.ClusterNetworkingConfig:
 		item, err = itemFromClusterNetworkingConfig(r)
 	case types.AuthPreference:
@@ -433,9 +433,9 @@ func itemsFromLocalAuthSecrets(user string, auth types.LocalAuthSecrets) ([]back
 	return items, nil
 }
 
-// itemFromLock attempts to encode the supplied lock as an
+// LockItem attempts to encode the supplied lock as an
 // instance of `backend.Item` suitable for storage.
-func itemFromLock(l types.Lock) (*backend.Item, error) {
+func LockItem(l types.Lock) (*backend.Item, error) {
 	if err := services.CheckAndSetDefaults(l); err != nil {
 		return nil, trace.Wrap(err)
 	}

@@ -25,8 +25,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: {fetch-depth: 0, persist-credentials: false}
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with: {go-version: '1.25.14', cache: true}
       - run: bash build.assets/cooplay/keycloak.sh test
@@ -36,8 +43,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: {fetch-depth: 0, persist-credentials: false}
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with: {go-version: '1.25.14', cache: true}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
@@ -49,7 +63,8 @@ jobs:
       - name: Build full UI twice and compare every asset
         run: |
           bash build.assets/cooplay/full-build.sh ui
-          find webassets/teleport -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/ui-first.sha256
+          # apphash is a per-build cache-busting ID, not built content.
+          find webassets/teleport -type f ! -name apphash -print0 | sort -z | xargs -0 sha256sum > /tmp/ui-first.sha256
           bash build.assets/cooplay/full-build.sh ui
           sha256sum --check /tmp/ui-first.sha256
       - name: Build Linux binaries twice and compare every artifact
@@ -75,4 +90,78 @@ jobs:
           path: |
             build/cooplay-candidate/linux-arm64/manifest.json
             build/cooplay-candidate/real-keycloak-result.json
+          retention-days: 14
+  # Manual release inputs: the bundled UI is built on arm64 like the candidate
+  # job, then the Linux amd64 binaries are built natively in the pinned amd64
+  # buildbox. The artifact is the exact install.py stage input (manifest.json
+  # plus teleport, tsh, tctl); publishing a release stays a separate step.
+  release-ui:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with: {go-version: '1.25.14', cache: true}
+      - name: Use task-local caches
+        run: |
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+      - run: bash build.assets/cooplay/full-build.sh ui
+      - run: tar -C webassets -czf /tmp/webassets-teleport.tar.gz teleport
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-webassets
+          path: /tmp/webassets-teleport.tar.gz
+          retention-days: 3
+  release-linux-amd64:
+    if: github.event_name == 'workflow_dispatch'
+    needs: release-ui
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
+        with: {go-version: '1.25.14', cache: true}
+      - name: Use task-local caches
+        run: |
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with: {name: release-webassets, path: /tmp/release-webassets}
+      - run: mkdir -p webassets && tar -C webassets -xzf /tmp/release-webassets/webassets-teleport.tar.gz
+      - run: bash build.assets/cooplay/full-build.sh linux-amd64
+      - name: Check the manifest is clean and complete
+        run: |
+          python3 - <<'PY'
+          import json
+          m = json.load(open('build/cooplay-candidate/linux-amd64/manifest.json'))
+          assert not m['dirty'], 'dirty build'
+          assert m['profile'] == 'full-ui-keycloak-candidate' and m['webassets']
+          assert m['go_environment']['GOOS'] == 'linux' and m['go_environment']['GOARCH'] == 'amd64'
+          assert set(m['artifacts']) == {'teleport', 'tsh', 'tctl'}
+          print(m['fork_revision'])
+          PY
+          sha256sum build/cooplay-candidate/linux-amd64/manifest.json
+      - run: git diff --exit-code && git diff --check
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-linux-amd64
+          path: build/cooplay-candidate/linux-amd64/
           retention-days: 14

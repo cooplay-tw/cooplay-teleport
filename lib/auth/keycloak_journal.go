@@ -107,13 +107,13 @@ func (s *keycloakService) replayJournal(ctx context.Context) error {
 				continue
 			}
 			if err := s.lifecyclePut(ctx, keycloakLifecycleKey("revocations", value.Kind, value.ID), value.Revocation, value.Expires, true); err != nil && !trace.IsAlreadyExists(err) {
-				return err
+				return keycloakSyncBackendFailure("journal_replay", err)
 			}
 			// Startup must apply native locks synchronously before a restored
 			// Auth can serve an old certificate. Waiting for the first background
 			// reconciliation pass would create an avoidable recovery race.
 			if err := s.ensureLock(ctx, "keycloak-revoke-"+keycloakDigest(value.Kind+"\x00"+value.ID), value.Revocation.Target, value.Revocation.Reason, value.Expires); err != nil {
-				return err
+				return keycloakSyncBackendFailure("journal_replay", err)
 			}
 		}
 		if err == io.EOF {

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 )
 
 type keycloakAdminFixture struct{ disabled, removed, unavailable, ended, brokenSessions atomic.Bool }
@@ -37,6 +39,7 @@ type keycloakAdminFixture struct{ disabled, removed, unavailable, ended, brokenS
 func managedKeycloakFixture(t *testing.T, sessionSeconds ...int) (*keycloakFixture, *keycloakAdminFixture, auth.KeycloakLifecycleConfig) {
 	t.Helper()
 	f := newKeycloakFixture(t)
+	f.refreshExpires = 30 * 24 * 60 * 60
 	admin := &keycloakAdminFixture{}
 	f.adminHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -104,6 +107,156 @@ func managedKeycloakFixture(t *testing.T, sessionSeconds ...int) (*keycloakFixtu
 	f.a.AuthServer.SetOIDCService(f.svc)
 	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
 	return f, admin, cfg
+}
+
+func TestKeycloakManagedSessionDeadline(t *testing.T) {
+	f, _, cfg := managedKeycloakFixture(t, 86400)
+	cfg.MaxStaleSeconds = 30
+	var err error
+	f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	f.a.AuthServer.SetOIDCService(f.svc)
+	srv := managedTLS(t, f)
+
+	f.refreshExpires = 120
+	f.exchangeDelay = 5 * time.Second
+	for _, web := range []bool{false, true} {
+		name := "CLI"
+		if web {
+			name = "web"
+		}
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+			_, q := f.begin(t, web, func(c map[string]any) { c["sid"] = "sid-a" })
+			start := f.clock.Now()
+			deadline := start.Add(120 * time.Second)
+			response, err := f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+			require.NoError(t, err)
+			require.Equal(t, start.Add(f.exchangeDelay), f.clock.Now())
+			user, err := f.a.AuthServer.GetUser(f.ctx, response.Username, false)
+			require.NoError(t, err)
+			require.Equal(t, deadline, user.Expiry())
+
+			assertCerts := func(sshCert, tlsCert []byte) {
+				t.Helper()
+				key, _, _, _, err := ssh.ParseAuthorizedKey(sshCert)
+				require.NoError(t, err)
+				require.LessOrEqual(t, key.(*ssh.Certificate).ValidBefore, uint64(deadline.Unix()))
+				cert, err := tlsca.ParseCertificatePEM(tlsCert)
+				require.NoError(t, err)
+				require.False(t, cert.NotAfter.After(deadline))
+				require.WithinDuration(t, deadline, cert.NotAfter, 2*time.Second)
+			}
+			if !web {
+				assertCerts(response.Cert, response.TLSCert)
+				return
+			}
+			session := response.Session
+			require.False(t, session.GetExpiryTime().After(deadline))
+			assertCerts(session.GetPub(), session.GetTLSCert())
+			client, err := srv.NewClientFromWebSession(session)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, client.Close()) })
+			f.clock.Advance(10 * time.Second)
+			renewed, err := client.ExtendWebSession(f.ctx, authclient.WebSessionReq{User: response.Username, PrevSessionID: session.GetName()})
+			require.NoError(t, err)
+			require.False(t, renewed.GetExpiryTime().After(deadline))
+			cert, err := tlsca.ParseCertificatePEM(renewed.GetTLSCert())
+			require.NoError(t, err)
+			require.False(t, cert.NotAfter.After(deadline))
+		})
+	}
+}
+
+func TestKeycloakManagedInvalidRefreshLifetime(t *testing.T) {
+	f, _, _ := managedKeycloakFixture(t)
+	for _, tc := range []struct {
+		name     string
+		lifetime any
+	}{
+		{name: "missing"},
+		{name: "zero", lifetime: 0},
+		{name: "negative", lifetime: -1},
+		{name: "non-numeric", lifetime: "invalid"},
+		{name: "fractional", lifetime: 120.5},
+		{name: "huge", lifetime: 400*24*60*60 + 1},
+		{name: "too soon", lifetime: 59},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f.refreshExpires = tc.lifetime
+			_, q := f.begin(t, false, func(c map[string]any) { c["sid"] = "sid-a" })
+			response, err := f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+			require.ErrorContains(t, err, "Keycloak authentication rejected")
+			require.Nil(t, response)
+		})
+	}
+}
+
+func TestKeycloakManagedReauthMaxAge(t *testing.T) {
+	f, _, cfg := managedKeycloakFixture(t)
+	req, q := f.begin(t, false, func(c map[string]any) { c["sid"] = "sid-a" })
+	redirect, err := url.Parse(req.RedirectURL)
+	require.NoError(t, err)
+	require.Equal(t, "login", redirect.Query().Get("prompt"))
+	require.False(t, redirect.Query().Has("max_age"))
+	_, err = f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+	require.NoError(t, err, "disabled age check accepts a missing auth_time")
+
+	cfg.ReauthMaxAgeSeconds = 120
+	f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	f.a.AuthServer.SetOIDCService(f.svc)
+	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	now := f.clock.Now().Unix()
+	for _, tc := range []struct {
+		name     string
+		authTime any
+		valid    bool
+	}{
+		{name: "missing"},
+		{name: "old", authTime: now - 151},
+		{name: "future", authTime: now + 31},
+		{name: "fractional", authTime: float64(now) - 0.5},
+		{name: "string", authTime: "120"},
+		{name: "fresh", authTime: now - 60, valid: true},
+		{name: "oldest allowed", authTime: now - 150, valid: true},
+		{name: "latest allowed", authTime: now + 30, valid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, q := f.begin(t, false, func(c map[string]any) {
+				c["sid"] = "sid-a"
+				if tc.authTime != nil {
+					c["auth_time"] = tc.authTime
+				}
+			})
+			redirect, err := url.Parse(req.RedirectURL)
+			require.NoError(t, err)
+			require.Equal(t, "120", redirect.Query().Get("max_age"))
+			require.False(t, redirect.Query().Has("prompt"))
+			response, err := f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+			if tc.valid {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+			} else {
+				require.ErrorContains(t, err, "Keycloak authentication rejected")
+				require.Nil(t, response)
+			}
+		})
+	}
+}
+
+func TestKeycloakManagedReauthConfigBounds(t *testing.T) {
+	f, _, cfg := managedKeycloakFixture(t)
+	for _, age := range []int{-1, 1, 29, 601} {
+		cfg.ReauthMaxAgeSeconds = age
+		_, err := auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+		require.ErrorContains(t, err, "reauth_max_age_seconds", "age %d", age)
+	}
+	for _, age := range []int{0, 30, 600} {
+		cfg.ReauthMaxAgeSeconds = age
+		_, err := auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+		require.NoError(t, err, "age %d", age)
+	}
 }
 
 func managedLogin(t *testing.T, f *keycloakFixture, sid string) (*authclient.OIDCAuthResponse, []string) {
