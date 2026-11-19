@@ -127,6 +127,18 @@ reported lifetime to the exchange start time and uses that deadline to cap
 credentials. A missing or invalid value, or insufficient remaining lifetime,
 rejects login. Auth retains no refresh or offline tokens. If Keycloak ends an
 online client session early, reconciliation still revokes the associated logins.
+
+Optional Auth-local `reauth_max_age_seconds` defaults to 0, which sends
+`prompt=login` and leaves `auth_time` optional. Values from 30 through 600
+send OIDC `max_age` instead. Auth then requires an integer ID-token
+`auth_time` no older than the configured window plus 30 seconds and no more
+than 30 seconds in the future. Enable the Keycloak `basic` scope or an
+equivalent mapper for the Teleport client before enabling this setting.
+Keycloak can reuse authentication from another client in the same browser
+SSO session. Verify that the realm requires OTP on all applicable login paths
+before allowing reuse. Connector resources still reject `max_age`.
+Configuration changes require an Auth restart. When reverting to an older
+binary, restore the previous `lifecycle.json` at the same time.
 Set deployment-specific SSH idle time separately; no company defaults are baked
 into this public fork.
 

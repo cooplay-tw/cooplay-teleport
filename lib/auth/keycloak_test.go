@@ -223,7 +223,6 @@ func (f *keycloakFixture) begin(t *testing.T, web bool, change func(map[string]a
 	require.NoError(t, err)
 	q := u.Query()
 	require.Equal(t, "S256", q.Get("code_challenge_method"))
-	require.Equal(t, "login", q.Get("prompt"))
 	require.Equal(t, "code", q.Get("response_type"))
 	require.NotEmpty(t, q.Get("nonce"))
 	require.NotEmpty(t, q.Get("code_challenge"))
@@ -245,6 +244,10 @@ func TestKeycloakNativeLogin(t *testing.T) {
 	for _, web := range []bool{false, true} {
 		t.Run(fmt.Sprintf("web=%v", web), func(t *testing.T) {
 			req, callback := f.begin(t, web, func(c map[string]any) { c["email"] = fmt.Sprintf("mutable-%v@example.test", web) })
+			redirect, err := url.Parse(req.RedirectURL)
+			require.NoError(t, err)
+			require.Equal(t, "login", redirect.Query().Get("prompt"))
+			require.False(t, redirect.Query().Has("max_age"))
 			stored, err := f.a.AuthServer.GetOIDCAuthRequest(f.ctx, req.StateToken)
 			require.NoError(t, err)
 			require.Empty(t, stored.PkceVerifier)
@@ -447,6 +450,9 @@ func TestKeycloakConnectorRestrictions(t *testing.T) {
 		"template roles":     func(c *types.OIDCConnectorV3) { c.Spec.ClaimsToRoles[0].Roles = []string{"{{external.groups}}"} },
 		"non-group mapping":  func(c *types.OIDCConnectorV3) { c.Spec.ClaimsToRoles[0].Claim = "email" },
 		"unsupported prompt": func(c *types.OIDCConnectorV3) { c.Spec.Prompt = "none" },
+		"unsupported max_age": func(c *types.OIDCConnectorV3) {
+			c.Spec.MaxAge = &types.MaxAge{Value: types.Duration(120 * time.Second)}
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

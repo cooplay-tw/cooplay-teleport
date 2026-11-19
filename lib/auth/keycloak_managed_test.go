@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,6 +189,73 @@ func TestKeycloakManagedInvalidRefreshLifetime(t *testing.T) {
 			require.ErrorContains(t, err, "Keycloak authentication rejected")
 			require.Nil(t, response)
 		})
+	}
+}
+
+func TestKeycloakManagedReauthMaxAge(t *testing.T) {
+	f, _, cfg := managedKeycloakFixture(t)
+	req, q := f.begin(t, false, func(c map[string]any) { c["sid"] = "sid-a" })
+	redirect, err := url.Parse(req.RedirectURL)
+	require.NoError(t, err)
+	require.Equal(t, "login", redirect.Query().Get("prompt"))
+	require.False(t, redirect.Query().Has("max_age"))
+	_, err = f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+	require.NoError(t, err, "disabled age check accepts a missing auth_time")
+
+	cfg.ReauthMaxAgeSeconds = 120
+	f.svc, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	f.a.AuthServer.SetOIDCService(f.svc)
+	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
+	now := f.clock.Now().Unix()
+	for _, tc := range []struct {
+		name     string
+		authTime any
+		valid    bool
+	}{
+		{name: "missing"},
+		{name: "old", authTime: now - 151},
+		{name: "future", authTime: now + 31},
+		{name: "fractional", authTime: float64(now) - 0.5},
+		{name: "string", authTime: "120"},
+		{name: "fresh", authTime: now - 60, valid: true},
+		{name: "oldest allowed", authTime: now - 150, valid: true},
+		{name: "latest allowed", authTime: now + 30, valid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, q := f.begin(t, false, func(c map[string]any) {
+				c["sid"] = "sid-a"
+				if tc.authTime != nil {
+					c["auth_time"] = tc.authTime
+				}
+			})
+			redirect, err := url.Parse(req.RedirectURL)
+			require.NoError(t, err)
+			require.Equal(t, "120", redirect.Query().Get("max_age"))
+			require.False(t, redirect.Query().Has("prompt"))
+			response, err := f.svc.ValidateOIDCAuthCallback(f.ctx, q)
+			if tc.valid {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+			} else {
+				require.ErrorContains(t, err, "Keycloak authentication rejected")
+				require.Nil(t, response)
+			}
+		})
+	}
+}
+
+func TestKeycloakManagedReauthConfigBounds(t *testing.T) {
+	f, _, cfg := managedKeycloakFixture(t)
+	for _, age := range []int{-1, 1, 29, 601} {
+		cfg.ReauthMaxAgeSeconds = age
+		_, err := auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+		require.ErrorContains(t, err, "reauth_max_age_seconds", "age %d", age)
+	}
+	for _, age := range []int{0, 30, 600} {
+		cfg.ReauthMaxAgeSeconds = age
+		_, err := auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+		require.NoError(t, err, "age %d", age)
 	}
 }
 

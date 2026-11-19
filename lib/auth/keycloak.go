@@ -133,7 +133,7 @@ func ValidateKeycloakConnector(c types.OIDCConnector) error {
 		return trace.BadParameter("unsupported Keycloak connector option")
 	}
 	if _, configured := c.GetMaxAge(); configured {
-		return trace.BadParameter("max_age is unsupported; Keycloak always requests prompt=login")
+		return trace.BadParameter("max_age must be configured in the Auth-local Keycloak lifecycle file")
 	}
 	if concrete.Spec.Prompt != "" && concrete.Spec.Prompt != "login" {
 		return trace.BadParameter("Keycloak requires prompt=login")
@@ -269,7 +269,11 @@ func (s *keycloakService) CreateOIDCAuthRequest(ctx context.Context, req types.O
 	}
 	verifier := oauth2.GenerateVerifier()
 	req.LoginHint = "" // Identity is never bound by an unverified email hint.
-	req.RedirectURL = config.AuthCodeURL(req.StateToken, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier), oauth2.SetAuthURLParam("prompt", "login"))
+	prompt := oauth2.SetAuthURLParam("prompt", "login")
+	if s.lifecycle != nil && s.lifecycle.ReauthMaxAgeSeconds != 0 {
+		prompt = oauth2.SetAuthURLParam("max_age", strconv.Itoa(s.lifecycle.ReauthMaxAgeSeconds))
+	}
+	req.RedirectURL = config.AuthCodeURL(req.StateToken, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier), prompt)
 	fingerprint, err := keycloakFingerprint(c)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -431,6 +435,18 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 	}
 	if id.Issuer != c.GetIssuerURL() || subtle.ConstantTimeCompare([]byte(id.Nonce), []byte(stored.Nonce)) != 1 || id.Subject == "" || len(id.Subject) > 512 || strings.ContainsRune(id.Subject, 0) || id.IssuedAt.IsZero() || id.IssuedAt.After(s.a.clock.Now().Add(30*time.Second)) {
 		return nil, trace.AccessDenied("invalid Keycloak identity binding")
+	}
+	if s.lifecycle != nil && s.lifecycle.ReauthMaxAgeSeconds != 0 {
+		var claims struct {
+			AuthTime *int64 `json:"auth_time"`
+		}
+		now := s.a.clock.Now()
+		oldest := now.Add(-time.Duration(s.lifecycle.ReauthMaxAgeSeconds+30) * time.Second)
+		if id.Claims(&claims) != nil || claims.AuthTime == nil || *claims.AuthTime < oldest.Unix() ||
+			*claims.AuthTime > now.Add(30*time.Second).Unix() || time.Unix(*claims.AuthTime, 0).Before(oldest) {
+			s.a.logger.WarnContext(ctx, "Keycloak ID token has missing, invalid or out-of-window auth_time", "connector", c.GetName())
+			return nil, trace.AccessDenied("invalid Keycloak authentication time")
+		}
 	}
 	var claims struct {
 		Groups          []string `json:"groups"`

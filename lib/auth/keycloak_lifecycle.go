@@ -43,6 +43,7 @@ type KeycloakLifecycleConfig struct {
 	PollSeconds          int                                   `json:"poll_seconds"`
 	MaxSessionSeconds    int                                   `json:"max_session_seconds,omitempty"`
 	MaxStaleSeconds      int                                   `json:"max_stale_seconds"`
+	ReauthMaxAgeSeconds  int                                   `json:"reauth_max_age_seconds,omitempty"`
 	Connectors           map[string]KeycloakLifecycleConnector `json:"connectors"`
 }
 
@@ -89,6 +90,9 @@ func keycloakGuard(connector string) string { return keycloakGuardPrefix + keycl
 func NewManagedKeycloakService(a *Server, cfg KeycloakLifecycleConfig) (OIDCService, error) {
 	if cfg.MaxSessionSeconds != 0 && (cfg.MaxSessionSeconds < int(keycloakSessionTTL/time.Second) || cfg.MaxSessionSeconds > int(keycloakMaxSessionTTL/time.Second)) {
 		return nil, trace.BadParameter("Keycloak max_session_seconds must be omitted or between 300 and 2592000")
+	}
+	if cfg.ReauthMaxAgeSeconds != 0 && (cfg.ReauthMaxAgeSeconds < 30 || cfg.ReauthMaxAgeSeconds > 600) {
+		return nil, trace.BadParameter("Keycloak reauth_max_age_seconds must be 0 or between 30 and 600")
 	}
 	if cfg.PollSeconds < 1 || cfg.PollSeconds > 30 || cfg.MaxStaleSeconds < cfg.PollSeconds*2 || cfg.MaxStaleSeconds > 120 || len(cfg.Connectors) == 0 {
 		return nil, trace.BadParameter("Keycloak requires a 1..30s poll interval, 2 intervals..120s staleness, and connectors")

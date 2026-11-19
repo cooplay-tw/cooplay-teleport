@@ -3,6 +3,7 @@
 ## Cooplay fork (unreleased)
 
 * Managed Keycloak logins require a valid `refresh_expires_in` token response field and cap CLI and web credentials at the Keycloak session deadline.
+* Added optional Auth-local `reauth_max_age_seconds` for Keycloak. It defaults to off. Restore the previous `lifecycle.json` when rolling back to a binary that predates the field.
 
 ## 18.11.1 (09/15/26)
 
