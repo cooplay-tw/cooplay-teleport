@@ -63,7 +63,8 @@ jobs:
       - name: Build full UI twice and compare every asset
         run: |
           bash build.assets/cooplay/full-build.sh ui
-          find webassets/teleport -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/ui-first.sha256
+          # apphash is a per-build cache-busting ID, not built content.
+          find webassets/teleport -type f ! -name apphash -print0 | sort -z | xargs -0 sha256sum > /tmp/ui-first.sha256
           bash build.assets/cooplay/full-build.sh ui
           sha256sum --check /tmp/ui-first.sha256
       - name: Build Linux binaries twice and compare every artifact
@@ -144,7 +145,7 @@ jobs:
           echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with: {name: release-webassets, path: /tmp/release-webassets}
-      - run: tar -C webassets -xzf /tmp/release-webassets/webassets-teleport.tar.gz
+      - run: mkdir -p webassets && tar -C webassets -xzf /tmp/release-webassets/webassets-teleport.tar.gz
       - run: bash build.assets/cooplay/full-build.sh linux-amd64
       - name: Check the manifest is clean and complete
         run: |
