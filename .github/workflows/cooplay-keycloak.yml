@@ -25,8 +25,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: {fetch-depth: 0, persist-credentials: false}
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with: {go-version: '1.25.14', cache: true}
       - run: bash build.assets/cooplay/keycloak.sh test
@@ -36,8 +43,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: {fetch-depth: 0, persist-credentials: false}
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with: {go-version: '1.25.14', cache: true}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
@@ -85,8 +99,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: {fetch-depth: 0, persist-credentials: false}
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with: {go-version: '1.25.14', cache: true}
       - name: Use task-local caches
@@ -106,8 +127,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: {fetch-depth: 0, persist-credentials: false}
+      # actions/checkout fails on the upstream enterprise gitlink `e`, which has
+      # no .gitmodules URL in this fork. A blobless fetch keeps full history.
+      - name: Check out (no submodules, no persisted credentials)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --filter=blob:none --no-tags origin "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          git log -1 --format='checked out %H'
       - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00
         with: {go-version: '1.25.14', cache: true}
       - name: Use task-local caches
