@@ -68,14 +68,16 @@ accept only authenticated native Proxy identities.
   See [SSH example](../../examples/keycloak/role.yaml),
   [Kubernetes example](../../examples/keycloak/kubernetes-role.yaml) and
   [Coder example](../../examples/keycloak/coder-app-role.yaml).
-- Teleport signs the normal SSH/TLS credentials. Lifetime is the minimum of
-  requested TTL, role TTL and the Auth-local session cap. The default also caps
+- Teleport signs the normal SSH/TLS credentials. Lifetime is bounded by the
+  requested TTL, role TTL, Auth-local session cap and the Keycloak session
+  deadline. The default also caps
   the session at the ID-token remaining lifetime. With an explicit managed cap
   above five minutes, a freshly validated ID token authenticates the exchange;
   its later expiry is independent of the bounded Teleport session. Expired or
   insufficiently valid ID tokens still fail login. Native reissue and web renewal
-  preserve the original deadline and role generation. No refresh/offline tokens
-  are retained; IdP online sessions continue to govern revocation.
+  preserve the original deadline and role generation. Application sessions
+  also stay within the login deadline. IdP online sessions continue to govern
+  revocation.
 - Every login carries two extra **zero-grant** roles: a unique login marker and
   a connector health marker. Native locks target these markers without adding
   resource privileges. The stored user's roles remain the actual mapped roles.
@@ -118,9 +120,13 @@ that rejects this field until the old settings and bounded-session contract have
 been restored. Outstanding longer credentials must remain fenced by locks and
 their original deadlines; do not erase journals to roll back.
 
-IdP SSO/client session idle and maximum durations are independent upper bounds:
-if Keycloak expires the online client session, reconciliation revokes Teleport
-even before this cap. This setting does not refresh or prolong a Keycloak session.
+Keep refresh-token issuance enabled for the Teleport client in Keycloak.
+Managed CLI and web login require a positive integer `refresh_expires_in`
+of at most 400 days in the authorization-code exchange response. Auth adds the
+reported lifetime to the exchange start time and uses that deadline to cap
+credentials. A missing or invalid value, or insufficient remaining lifetime,
+rejects login. Auth retains no refresh or offline tokens. If Keycloak ends an
+online client session early, reconciliation still revokes the associated logins.
 Set deployment-specific SSH idle time separately; no company defaults are baked
 into this public fork.
 

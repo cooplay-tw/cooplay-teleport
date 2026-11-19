@@ -47,28 +47,32 @@ import (
 const keycloakTestSecret = "fixture-client-secret-not-a-real-credential"
 
 type keycloakCode struct {
-	claims    map[string]any
-	challenge string
-	key       *rsa.PrivateKey
+	claims         map[string]any
+	challenge      string
+	key            *rsa.PrivateKey
+	refreshExpires any
+	exchangeDelay  time.Duration
 }
 
 type keycloakFixture struct {
-	requestedTTL time.Duration
-	ctx          context.Context
-	clock        *clockwork.FakeClock
-	a            *authtest.AuthServer
-	svc          auth.OIDCService
-	idp          *httptest.Server
-	key          *rsa.PrivateKey
-	connector    types.OIDCConnector
-	emitter      *eventstest.MockRecorderEmitter
-	sshKey       []byte
-	tlsKey       []byte
-	mu           sync.Mutex
-	codes        map[string]keycloakCode
-	sequence     atomic.Int64
-	exchanges    atomic.Int64
-	adminHandler http.Handler
+	refreshExpires any
+	exchangeDelay  time.Duration
+	requestedTTL   time.Duration
+	ctx            context.Context
+	clock          *clockwork.FakeClock
+	a              *authtest.AuthServer
+	svc            auth.OIDCService
+	idp            *httptest.Server
+	key            *rsa.PrivateKey
+	connector      types.OIDCConnector
+	emitter        *eventstest.MockRecorderEmitter
+	sshKey         []byte
+	tlsKey         []byte
+	mu             sync.Mutex
+	codes          map[string]keycloakCode
+	sequence       atomic.Int64
+	exchanges      atomic.Int64
+	adminHandler   http.Handler
 }
 
 func newKeycloakFixture(t *testing.T) *keycloakFixture {
@@ -170,7 +174,12 @@ func (f *keycloakFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "sign error", http.StatusInternalServerError)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "unused-access-token", "token_type": "Bearer", "expires_in": 300, "id_token": raw, "refresh_token": "must-never-be-retained"})
+		f.clock.Advance(code.exchangeDelay)
+		reply := map[string]any{"access_token": "unused-access-token", "token_type": "Bearer", "expires_in": 300, "id_token": raw, "refresh_token": "must-never-be-retained"}
+		if code.refreshExpires != nil {
+			reply["refresh_expires_in"] = code.refreshExpires
+		}
+		_ = json.NewEncoder(w).Encode(reply)
 	default:
 		http.NotFound(w, r)
 	}
@@ -225,7 +234,7 @@ func (f *keycloakFixture) begin(t *testing.T, web bool, change func(map[string]a
 	}
 	code := fmt.Sprintf("fixture-authorization-code-%d", f.sequence.Add(1))
 	f.mu.Lock()
-	f.codes[code] = keycloakCode{claims: claims, challenge: q.Get("code_challenge"), key: f.key}
+	f.codes[code] = keycloakCode{claims: claims, challenge: q.Get("code_challenge"), key: f.key, refreshExpires: f.refreshExpires, exchangeDelay: f.exchangeDelay}
 	f.mu.Unlock()
 	return req, url.Values{"state": {req.StateToken}, "code": {code}, "iss": {f.idp.URL + "/realms/lab"}}
 }

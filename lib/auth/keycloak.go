@@ -11,10 +11,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -407,9 +409,17 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 	if err != nil {
 		return nil, err
 	}
+	exchangeStart := s.a.clock.Now()
 	token, err := config.Exchange(httpCtx, q.Get("code"), oauth2.VerifierOption(stored.Verifier))
 	if err != nil {
 		return nil, trace.AccessDenied("Keycloak code exchange failed")
+	}
+	var sessionCap time.Time
+	if remaining := keycloakRefreshLifetime(token.Extra("refresh_expires_in")); remaining > 0 {
+		sessionCap = exchangeStart.Add(remaining)
+	} else if s.lifecycle != nil {
+		s.a.logger.WarnContext(ctx, "Keycloak token response has missing or invalid refresh_expires_in", "connector", c.GetName())
+		return nil, trace.AccessDenied("invalid Keycloak session lifetime")
 	}
 	raw, ok := token.Extra("id_token").(string)
 	if !ok || len(raw) > 64*1024 {
@@ -483,6 +493,13 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 		return nil, trace.AccessDenied("Keycloak login-state augmentation is unsupported")
 	}
 	expires := now.Add(ttl)
+	if !sessionCap.IsZero() && sessionCap.Before(expires) {
+		expires = sessionCap
+	}
+	if !sessionCap.IsZero() && expires.Sub(s.a.clock.Now()) < apidefaults.MinCertDuration {
+		s.a.logger.WarnContext(ctx, "Keycloak session expires too soon", "connector", c.GetName())
+		return nil, trace.AccessDenied("Keycloak session expires too soon")
+	}
 	login, err := s.prepareLogin(ctx, c, id.Subject, claims.SID, username, claims.Groups, expires)
 	if err != nil {
 		return nil, err
@@ -505,6 +522,31 @@ func (s *keycloakService) ValidateOIDCAuthCallback(ctx context.Context, q url.Va
 		return nil, err
 	}
 	return response, nil
+}
+
+func keycloakRefreshLifetime(extra any) time.Duration {
+	// oauth2 decodes JSON extras as float64 or strings. Form-encoded
+	// integer extras are normalized to int64 by Token.Extra.
+	var seconds float64
+	switch value := extra.(type) {
+	case float64:
+		seconds = value
+	case int64:
+		seconds = float64(value)
+	case string:
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return 0
+		}
+		seconds = float64(parsed)
+	default:
+		return 0
+	}
+	const maxSeconds = 400 * 24 * 60 * 60
+	if !(seconds > 0 && seconds <= maxSeconds) || seconds != math.Trunc(seconds) {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func validateKeycloakRole(role types.Role) error {

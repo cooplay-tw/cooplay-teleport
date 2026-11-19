@@ -164,15 +164,16 @@ func requireKeycloakLock(t *testing.T, f *keycloakFixture, identity tlsca.Identi
 // API, ends no later than the absolute login deadline and the stored user.
 func TestKeycloakManagedAppCredentialsKeepLoginDeadline(t *testing.T) {
 	f, _, _, srv := managedCoderFixture(t)
+	f.refreshExpires = 4 * 60 * 60
 	login := managedConsoleLogin(t, f, srv, "sid-a")
 	deadline := login.identity.Expires
-	require.WithinDuration(t, f.clock.Now().Add(24*time.Hour), deadline, 5*time.Second)
+	require.WithinDuration(t, f.clock.Now().Add(4*time.Hour), deadline, 5*time.Second)
 	user, err := f.a.AuthServer.GetUser(f.ctx, login.username, false)
 	require.NoError(t, err)
 	require.False(t, deadline.After(user.Expiry()))
 
 	// Natively, an in-memory app certificate requested now could last a full
-	// role TTL from now, two hours past the original login deadline.
+	// role TTL from now, past the original login deadline.
 	f.clock.Advance(2 * time.Hour)
 	require.NoError(t, auth.ReconcileKeycloak(f.ctx, f.svc))
 	requireBounded := func(t *testing.T, limit time.Time) {

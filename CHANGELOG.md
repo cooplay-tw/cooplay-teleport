@@ -1,5 +1,9 @@
 # Changelog
 
+## Cooplay fork (unreleased)
+
+* Managed Keycloak logins require a valid `refresh_expires_in` token response field and cap CLI and web credentials at the Keycloak session deadline.
+
 ## 18.11.1 (09/15/26)
 
 * Added support for LSA protection, the Teleport Windows authentication package can now be used on hosts with LSA protection (RunAsPPL) enabled.
