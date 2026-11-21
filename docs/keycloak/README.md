@@ -86,6 +86,27 @@ accept only authenticated native Proxy identities.
   `prompt=login` alone is not an MFA guarantee. Hardware/WebAuthn enrollment and
   target device behavior require real devices; no hardware attestation is claimed.
 
+## Direct Keycloak web login
+
+Starting with `v18.11.1-cooplay.7`, `cooplay login` can start Teleport web SSO
+in the same tab by navigating directly to
+`/v1/webapi/oidc/login/web?connector_id=<id>&redirect_url=%2Fweb`. This skips the
+Teleport login page, which can send a browser with an older session to `/web`
+before SSO starts. A successful callback replaces the older session cookie.
+
+The start handler reuses a valid `__Host-grv_csrf` cookie. When the cookie is
+missing, empty or invalid, it sets a new host-only session cookie on the redirect
+to Keycloak with `HttpOnly`, `Secure`, `SameSite=None` and `Path=/`, and binds the
+auth request to the same token. The callback still requires a matching browser
+cookie before exchanging the authorization code. A missing or mismatched cookie
+rejects the callback before a web session can be issued.
+
+The plugin probes this endpoint with a cookie-less GET for `/web` and stops at
+the first redirect. It expects a `302` to the configured Keycloak issuer host and
+the CSRF `Set-Cookie` header. Rolling back to `v18.11.1-cooplay.6` restores the
+`302` to `/web/msg/error/login` for that probe. The new plugin detects the error
+redirect and uses its previous multi-tab flow.
+
 ## Managed configuration and secrets
 
 An Auth-local example (unusable addresses and no company values):

@@ -5828,6 +5828,18 @@ type SSORequestParams struct {
 // returning them in an SSORequestParams struct. If any fields are not present,
 // an error is returned.
 func ParseSSORequestParams(r *http.Request) (*SSORequestParams, error) {
+	req, err := parseSSORequestQuery(r)
+	if err != nil {
+		return nil, err
+	}
+	req.CSRFToken, err = csrf.ExtractTokenFromCookie(r)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return req, nil
+}
+
+func parseSSORequestQuery(r *http.Request) (*SSORequestParams, error) {
 	// Manually grab the value from query param "redirect_url".
 	//
 	// The "redirect_url" param can contain its own query params such as in
@@ -5858,19 +5870,11 @@ func ParseSSORequestParams(r *http.Request) (*SSORequestParams, error) {
 		return nil, trace.BadParameter("missing connector_id query parameter")
 	}
 
-	csrfToken, err := csrf.ExtractTokenFromCookie(r)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	scope := query.Get("scope")
-
 	return &SSORequestParams{
 		ClientRedirectURL: clientRedirectURL,
 		ConnectorID:       connectorID,
-		CSRFToken:         csrfToken,
 		LoginHint:         loginHint,
-		Scope:             scope,
+		Scope:             query.Get("scope"),
 	}, nil
 }
 

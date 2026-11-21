@@ -63,6 +63,12 @@ Its strict decoder rejects unknown fields such as `reauth_max_age_seconds`,
 even when set to zero. Capped logins use the existing expiry field in the
 backend record. Keep current revocation journals and locks during rollback.
 
+Rolling back from `v18.11.1-cooplay.7` to `v18.11.1-cooplay.6` restores the error
+redirect when a browser starts Keycloak web SSO without a CSRF cookie. The new
+`cooplay login` plugin detects this with its cookie-less probe and uses the
+previous multi-tab flow. Verify that revocation records and locks still deny
+the credentials they cover after rollback.
+
 For a rollback that removes this connector:
 
 1. Close the affected ingress and stop all credential issuers. Preserve current
