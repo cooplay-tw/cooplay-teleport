@@ -29,7 +29,7 @@ func (h *Handler) RegisterKeycloakHandlers() {
 }
 
 func (h *Handler) keycloakLoginWeb(w http.ResponseWriter, r *http.Request, _ httprouter.Params) string {
-	req, err := ParseSSORequestParams(r)
+	req, err := parseSSORequestQuery(r)
 	if err != nil {
 		return client.LoginFailedRedirectURL
 	}
@@ -37,9 +37,20 @@ func (h *Handler) keycloakLoginWeb(w http.ResponseWriter, r *http.Request, _ htt
 	if err != nil {
 		return client.LoginFailedRedirectURL
 	}
+	csrfToken, _ := csrf.ExtractTokenFromCookie(r)
+	if err := csrf.VerifyToken(csrfToken, r); err != nil {
+		// AddCSRFProtection reuses any nonempty cookie. Hide the invalid
+		// value from it so it generates a fresh token for this login.
+		bootstrap := r.Clone(r.Context())
+		bootstrap.Header.Del("Cookie")
+		csrfToken, err = csrf.AddCSRFProtection(w, bootstrap)
+		if err != nil {
+			return client.LoginFailedRedirectURL
+		}
+	}
 	response, err := h.cfg.ProxyClient.CreateOIDCAuthRequest(r.Context(), types.OIDCAuthRequest{
 		CheckUser:         true,
-		CSRFToken:         req.CSRFToken,
+		CSRFToken:         csrfToken,
 		ConnectorID:       req.ConnectorID,
 		CreateWebSession:  true,
 		ClientRedirectURL: req.ClientRedirectURL,
