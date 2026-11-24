@@ -161,6 +161,9 @@ func NewManagedKeycloakService(a *Server, cfg KeycloakLifecycleConfig) (OIDCServ
 		keycloakLastSync.WithLabelValues(name).Set(0)
 		svc.exportHealthLockEvents(a.CloseContext(), name)
 	}
+	// The replayed locks already fence old credentials. Bound the sweep so
+	// backend delays cannot hold up Auth indefinitely.
+	svc.sweepLockedAppSessions(a.CloseContext())
 	return svc, nil
 }
 
@@ -367,25 +370,33 @@ func (s *keycloakService) checkLoginRevocations(ctx context.Context, login *keyc
 }
 
 func (s *keycloakService) revokeAccount(ctx context.Context, user, reason string) error {
-	if err := s.persistRevocation(ctx, "users", user, types.LockTarget{User: user}, reason, time.Time{}); err != nil {
+	if err := s.persistRevocation(ctx, user, types.LockTarget{User: user}, reason, time.Time{}); err != nil {
 		return err
 	}
 	return trace.AccessDenied("Keycloak account revoked")
 }
 
-func (s *keycloakService) persistRevocation(ctx context.Context, kind, id string, target types.LockTarget, reason string, expires time.Time) error {
-	record := keycloakRevocation{Target: target, Reason: reason, Time: s.a.clock.Now().UTC(), Expires: expires}
-	if err := s.appendJournal(keycloakJournalEntry{Kind: kind, ID: id, Revocation: record, Expires: expires}); err != nil {
-		_ = s.lifecyclePut(ctx, keycloakLifecycleKey("revocations", kind, id), record, expires, true)
-		_ = s.ensureLock(ctx, "keycloak-revoke-"+keycloakDigest(kind+"\x00"+id), target, reason, expires)
-		return err
+func (s *keycloakService) persistRevocation(ctx context.Context, user string, target types.LockTarget, reason string, expires time.Time) error {
+	kind, id := "users", target.User
+	if target.Role != "" {
+		kind, id = "roles", target.Role
 	}
+	record := keycloakRevocation{Target: target, Reason: reason, Time: s.a.clock.Now().UTC(), Expires: expires}
+	journalErr := s.appendJournal(keycloakJournalEntry{Kind: kind, ID: id, Revocation: record, Expires: expires})
 	// Durable intent precedes native lock application. Reconciliation repairs a
 	// crash between these operations; logins check the durable intent directly.
-	if err := s.lifecyclePut(ctx, keycloakLifecycleKey("revocations", kind, id), record, expires, true); err != nil && !trace.IsAlreadyExists(err) {
-		return err
+	putErr := s.lifecyclePut(ctx, keycloakLifecycleKey("revocations", kind, id), record, expires, true)
+	if journalErr == nil && putErr != nil && !trace.IsAlreadyExists(putErr) {
+		return putErr
 	}
-	return s.ensureLock(ctx, "keycloak-revoke-"+keycloakDigest(kind+"\x00"+id), target, reason, expires)
+	lockErr := s.ensureLock(ctx, "keycloak-revoke-"+keycloakDigest(kind+"\x00"+id), target, reason, expires)
+	if lockErr == nil && !trace.IsAlreadyExists(putErr) && (expires.IsZero() || expires.After(s.a.clock.Now())) {
+		s.purgeRevokedAppSessions(ctx, user, target)
+	}
+	if journalErr != nil {
+		return journalErr
+	}
+	return lockErr
 }
 
 func (s *keycloakService) ensureLock(ctx context.Context, name string, target types.LockTarget, reason string, expirations ...time.Time) error {
@@ -555,18 +566,18 @@ func (s *keycloakService) reconcile(ctx context.Context) (resultErr error) {
 					}
 				}
 				if !enabled {
-					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "users", login.Username, types.LockTarget{User: login.Username}, "account-disabled", time.Time{}))
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, login.Username, types.LockTarget{User: login.Username}, "account-disabled", time.Time{}))
 				}
 				if reason != "" {
 					// Retire this credential generation without blocking a fresh
 					// login using the user's remaining authoritative memberships.
-					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, reason, login.Expires.Add(24*time.Hour)))
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, login.Username, types.LockTarget{Role: login.Marker}, reason, login.Expires.Add(24*time.Hour)))
 				}
 				if !slices.Contains(account.sessions, login.SID) {
-					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, "idp-session-ended", login.Expires.Add(24*time.Hour)))
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, login.Username, types.LockTarget{Role: login.Marker}, "idp-session-ended", login.Expires.Add(24*time.Hour)))
 				}
 				if err := s.checkLoginRevocations(ctx, &login); err != nil {
-					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, "logout", login.Expires.Add(24*time.Hour)))
+					return keycloakSyncBackendFailure("revocation_persist", s.persistRevocation(ctx, login.Username, types.LockTarget{Role: login.Marker}, "logout", login.Expires.Add(24*time.Hour)))
 				}
 				return nil
 			})

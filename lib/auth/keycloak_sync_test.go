@@ -214,6 +214,7 @@ func TestKeycloakReconcileFencesWhenHealthLockAccountingFails(t *testing.T) {
 func TestKeycloakReconcileRedactsAccountFailures(t *testing.T) {
 	const name = "sync-redaction"
 	s, clock, logs := newKeycloakSyncTestService(t, name)
+	logs.Reset()
 	const subject, sid, username = "fixture-subject", "fixture-sid", "fixture-username"
 	login := keycloakLogin{Connector: name, Subject: subject, SID: sid, Username: username, Expires: clock.Now().Add(time.Hour)}
 	require.NoError(t, s.lifecyclePut(t.Context(), keycloakLifecycleKey("logins", "fixture-marker"), login, login.Expires, true))

@@ -6,6 +6,7 @@
 * Added optional Auth-local `reauth_max_age_seconds` for Keycloak. It defaults to off. Restore the previous `lifecycle.json` when rolling back to a binary that predates the field.
 * Added redacted Keycloak reconciliation diagnostics, pass and step metrics, and a restart-persistent outage lock count. Transient Admin request failures can retry once within the existing deadline.
 * For one-tab `cooplay login`, the Keycloak web SSO redirect now sets a CSRF cookie when the browser has no usable one. The callback still checks the cookie before exchanging the code. Rolling back to `v18.11.1-cooplay.6` restores the error redirect for cookie-less starts, which the new plugin detects to select its multi-tab flow.
+* Close app sessions covered by a Keycloak revocation and sweep older app sessions covered by a login-role lock at Auth startup. DBSC registration and refresh terminate locked, missing, or expired sessions and expire the old app cookies, allowing the browser to launch a fresh session.
 
 ## 18.11.1 (09/15/26)
 

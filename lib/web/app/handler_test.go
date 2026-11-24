@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,7 @@ import (
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	apiutils "github.com/gravitational/teleport/api/utils"
@@ -59,6 +61,7 @@ import (
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/jwt"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 )
@@ -609,11 +612,12 @@ type testServer struct {
 	serverConnContext atomic.Pointer[func(context.Context, net.Conn) context.Context]
 }
 
-func setup(t *testing.T, clock *clockwork.FakeClock, authClient authclient.ClientI, clusterGetter reversetunnelclient.ClusterGetter) *testServer {
+func setup(t *testing.T, clock *clockwork.FakeClock, authClient *mockAuthClient, clusterGetter reversetunnelclient.ClusterGetter) *testServer {
 	appHandler, err := NewHandler(context.Background(), &HandlerConfig{
 		Clock:                 clock,
 		AuthClient:            authClient,
 		AccessPoint:           authClient,
+		LockWatcher:           authClient,
 		ClusterGetter:         clusterGetter,
 		CipherSuites:          utils.DefaultCipherSuites(),
 		IntegrationAppHandler: &mockIntegrationAppHandler{},
@@ -685,15 +689,18 @@ func (p *testServer) makeRequestWithHeaders(t *testing.T, method, endpoint strin
 
 type mockAuthClient struct {
 	authclient.ClientI
-	clusterName   string
-	appSession    types.WebSession
-	sessionError  error
-	appServers    []types.AppServer
-	caKey         []byte
-	caCert        []byte
-	emittedEvents []apievents.AuditEvent
-	jwtSigner     crypto.Signer
-	mtx           sync.Mutex
+	clusterName     string
+	appSession      types.WebSession
+	sessionError    error
+	appServers      []types.AppServer
+	caKey           []byte
+	caCert          []byte
+	emittedEvents   []apievents.AuditEvent
+	jwtSigner       crypto.Signer
+	checkLock       func(constants.LockingMode, ...types.LockTarget) error
+	waitingForLocks bool
+	deleted         []string
+	mtx             sync.Mutex
 }
 
 type mockClusterName struct {
@@ -718,7 +725,21 @@ func (c *mockAuthClient) lastEmittedEvent() apievents.AuditEvent {
 }
 
 func (c *mockAuthClient) DeleteAppSession(ctx context.Context, r types.DeleteAppSessionRequest) error {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.deleted = append(c.deleted, r.SessionID)
 	return nil
+}
+
+func (c *mockAuthClient) CheckLockInForce(mode constants.LockingMode, targets ...types.LockTarget) error {
+	if c.checkLock != nil {
+		return c.checkLock(mode, targets...)
+	}
+	return nil
+}
+
+func (c *mockAuthClient) IsInitialized() bool {
+	return !c.waitingForLocks
 }
 
 func (c *mockAuthClient) GetClusterName(_ context.Context) (types.ClusterName, error) {
@@ -1152,6 +1173,120 @@ func TestDBSCRefresh(t *testing.T) {
 	require.Equal(t, SubjectCookieName, got.Credentials[1].Name)
 }
 
+func TestDBSCRevokedSession(t *testing.T) {
+	t.Parallel()
+
+	const clusterName, publicAddr = "test-cluster", "app.example.com"
+	caKey, caCert, err := tlsca.GenerateSelfSignedCA(pkix.Name{CommonName: clusterName}, nil, defaults.CATTL)
+	require.NoError(t, err)
+	roleLock, err := types.NewLock("role-lock", types.LockSpecV2{Target: types.LockTarget{Role: "access"}})
+	require.NoError(t, err)
+	healthLock, err := types.NewLock("keycloak-health-fixture", types.LockSpecV2{Target: types.LockTarget{Role: "keycloak-guard-fixture"}})
+	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name         string
+		lockErr      error
+		missing      bool
+		expired      bool
+		newerCookie  bool
+		register     bool
+		preserve     bool
+		waitForLocks bool
+	}{
+		{name: "locked refresh", lockErr: services.LockInForceAccessDenied(roleLock)},
+		{name: "locked registration", lockErr: services.LockInForceAccessDenied(roleLock), register: true},
+		{name: "missing session", missing: true},
+		{name: "expired session", expired: true},
+		{name: "newer app cookie", missing: true, newerCookie: true},
+		{name: "unreliable lock view", lockErr: services.StrictLockingModeAccessDenied, preserve: true},
+		{name: "waiting for initial lock view", waitForLocks: true, preserve: true},
+		{name: "temporary connector fence", lockErr: services.LockInForceAccessDenied(healthLock), preserve: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := clockwork.NewFakeClock()
+			ws := createAppSession(t, clock, caKey, caCert, clusterName, publicAddr, "testapp")
+			deviceKey, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+			require.NoError(t, err)
+			deviceJWK := jose.JSONWebKey{Key: deviceKey.Public()}
+			publicKey, err := deviceJWK.MarshalJSON()
+			require.NoError(t, err)
+			ws.SetDBSCPublicKey(publicKey)
+			client := &mockAuthClient{
+				clusterName:     clusterName,
+				appSession:      ws,
+				waitingForLocks: test.waitForLocks,
+				checkLock: func(mode constants.LockingMode, targets ...types.LockTarget) error {
+					if mode != constants.LockingModeStrict {
+						t.Error("DBSC must require a reliable lock view")
+					}
+					if !slices.Contains(targets, types.LockTarget{Role: "access"}) {
+						t.Error("DBSC lock check skipped the session certificate role")
+					}
+					return test.lockErr
+				},
+			}
+			if test.missing {
+				client.appSession = nil
+				client.sessionError = trace.NotFound("app session gone")
+			}
+			if test.expired {
+				clock.Advance(5 * time.Minute)
+			}
+			path := dbscRefreshPath
+			var cookies []http.Cookie
+			if test.register {
+				path = dbscRegistrationPath
+				cookies = []http.Cookie{{Name: CookieName, Value: ws.GetName()}, {Name: SubjectCookieName, Value: ws.GetBearerToken()}}
+			}
+			if test.newerCookie {
+				cookies = []http.Cookie{{Name: CookieName, Value: "new-app-session"}}
+			}
+			p := setup(t, clock, client, nil)
+			status, body, headers := p.makeRequestWithHeaders(t, http.MethodPost, path, nil, cookies, map[string]string{
+				secureSessionIDHeader: strconv.Quote(ws.GetName()),
+			})
+			client.mtx.Lock()
+			defer client.mtx.Unlock()
+			if test.preserve {
+				require.GreaterOrEqual(t, status, 500)
+				require.Empty(t, headers.Values("Set-Cookie"))
+				require.Empty(t, client.deleted)
+				return
+			}
+			require.Equal(t, http.StatusOK, status)
+			var result struct {
+				SessionIdentifier string `json:"session_identifier"`
+				Continue          *bool  `json:"continue"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(body), &result))
+			require.Equal(t, ws.GetName(), result.SessionIdentifier)
+			require.NotNil(t, result.Continue)
+			require.False(t, *result.Continue)
+			require.Empty(t, headers.Get(secureSessionChallengeHeader))
+			if test.newerCookie {
+				require.Empty(t, headers.Values("Set-Cookie"))
+			} else {
+				cookies := (&http.Response{Header: headers}).Cookies()
+				require.Len(t, cookies, 2)
+				require.Equal(t, CookieName, cookies[0].Name)
+				require.Equal(t, SubjectCookieName, cookies[1].Name)
+				for _, cookie := range cookies {
+					require.Empty(t, cookie.Value)
+					require.True(t, cookie.Expires.Before(clock.Now()))
+					require.True(t, cookie.Secure)
+					require.Equal(t, "/", cookie.Path)
+				}
+			}
+			if test.missing {
+				require.Empty(t, client.deleted)
+			} else {
+				require.Equal(t, []string{ws.GetName()}, client.deleted)
+			}
+		})
+	}
+}
+
 func TestDBSCRegistration(t *testing.T) {
 	t.Parallel()
 
@@ -1544,7 +1679,7 @@ func Test_checkForDualCredentialMismatch(t *testing.T) {
 	require.NoError(t, err)
 
 	appSession := createAppSession(t, clock, caKey, caCert, clusterName, publicAddr, "testapp")
-	appSessionIdentity, err := getIdentityFromWebSession(appSession)
+	appSessionIdentity, err := services.WebSessionTLSIdentity(appSession)
 	require.NoError(t, err)
 	require.NotNil(t, appSessionIdentity)
 

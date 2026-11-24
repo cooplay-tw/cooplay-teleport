@@ -107,6 +107,26 @@ the CSRF `Set-Cookie` header. Rolling back to `v18.11.1-cooplay.6` restores the
 `302` to `/web/msg/error/login` for that probe. The new plugin detects the error
 redirect and uses its previous multi-tab flow.
 
+## App sessions after revocation
+
+Starting with `v18.11.1-cooplay.8`, a new Keycloak login-role revocation
+removes stored app sessions for that user whose TLS certificate carries the
+locked role. An account revocation removes all app sessions for that account.
+After replaying journaled locks, Auth runs a paginated startup sweep for app
+sessions covered by an active login-role lock. The sweep has a ten-second
+budget and logs the scanned, deleted and failed counts.
+
+DBSC registration and refresh read the app session from Auth and check its
+certificate against the proxy's lock watcher. For a missing, expired or locked
+session, the proxy sends HTTP 200 with `continue: false` and the
+`session_identifier` Chromium expects. The proxy also expires both app
+cookies, unless the request already carries a different app session cookie.
+The next navigation to the app can use the launcher and the current Teleport
+web login. A temporary Keycloak connector fence or stale lock view pauses
+DBSC renewal and preserves the stored session.
+[DBSC session instructions](https://www.w3.org/TR/dbsc/#json-session-instructions) ·
+[Chromium parser](https://chromium.googlesource.com/chromium/src/+/main/net/device_bound_sessions/session_json_utils.cc)
+
 ## Managed configuration and secrets
 
 An Auth-local example (unusable addresses and no company values):

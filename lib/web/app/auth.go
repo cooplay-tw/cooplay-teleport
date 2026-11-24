@@ -35,6 +35,7 @@ import (
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/httplib"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
@@ -194,7 +195,7 @@ func (h *Handler) completeAppAuthExchange(w http.ResponseWriter, r *http.Request
 	}
 	if err := checkSubjectToken(req.SubjectCookieValue, ws); err != nil {
 		h.logger.WarnContext(r.Context(), "Request failed", "error", err)
-		identity, _ := getIdentityFromWebSession(ws)
+		identity, _ := services.WebSessionTLSIdentity(ws)
 		h.emitErrorEventAndDeleteAppSession(r, emitErrorEventFields{
 			sessionID:   req.CookieValue,
 			err:         err.Error(),
