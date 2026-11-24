@@ -689,17 +689,18 @@ func (p *testServer) makeRequestWithHeaders(t *testing.T, method, endpoint strin
 
 type mockAuthClient struct {
 	authclient.ClientI
-	clusterName   string
-	appSession    types.WebSession
-	sessionError  error
-	appServers    []types.AppServer
-	caKey         []byte
-	caCert        []byte
-	emittedEvents []apievents.AuditEvent
-	jwtSigner     crypto.Signer
-	checkLock     func(constants.LockingMode, ...types.LockTarget) error
-	deleted       []string
-	mtx           sync.Mutex
+	clusterName     string
+	appSession      types.WebSession
+	sessionError    error
+	appServers      []types.AppServer
+	caKey           []byte
+	caCert          []byte
+	emittedEvents   []apievents.AuditEvent
+	jwtSigner       crypto.Signer
+	checkLock       func(constants.LockingMode, ...types.LockTarget) error
+	waitingForLocks bool
+	deleted         []string
+	mtx             sync.Mutex
 }
 
 type mockClusterName struct {
@@ -735,6 +736,10 @@ func (c *mockAuthClient) CheckLockInForce(mode constants.LockingMode, targets ..
 		return c.checkLock(mode, targets...)
 	}
 	return nil
+}
+
+func (c *mockAuthClient) IsInitialized() bool {
+	return !c.waitingForLocks
 }
 
 func (c *mockAuthClient) GetClusterName(_ context.Context) (types.ClusterName, error) {
@@ -1180,13 +1185,14 @@ func TestDBSCRevokedSession(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, test := range []struct {
-		name        string
-		lockErr     error
-		missing     bool
-		expired     bool
-		newerCookie bool
-		register    bool
-		preserve    bool
+		name         string
+		lockErr      error
+		missing      bool
+		expired      bool
+		newerCookie  bool
+		register     bool
+		preserve     bool
+		waitForLocks bool
 	}{
 		{name: "locked refresh", lockErr: services.LockInForceAccessDenied(roleLock)},
 		{name: "locked registration", lockErr: services.LockInForceAccessDenied(roleLock), register: true},
@@ -1194,6 +1200,7 @@ func TestDBSCRevokedSession(t *testing.T) {
 		{name: "expired session", expired: true},
 		{name: "newer app cookie", missing: true, newerCookie: true},
 		{name: "unreliable lock view", lockErr: services.StrictLockingModeAccessDenied, preserve: true},
+		{name: "waiting for initial lock view", waitForLocks: true, preserve: true},
 		{name: "temporary connector fence", lockErr: services.LockInForceAccessDenied(healthLock), preserve: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1206,8 +1213,9 @@ func TestDBSCRevokedSession(t *testing.T) {
 			require.NoError(t, err)
 			ws.SetDBSCPublicKey(publicKey)
 			client := &mockAuthClient{
-				clusterName: clusterName,
-				appSession:  ws,
+				clusterName:     clusterName,
+				appSession:      ws,
+				waitingForLocks: test.waitForLocks,
 				checkLock: func(mode constants.LockingMode, targets ...types.LockTarget) error {
 					if mode != constants.LockingModeStrict {
 						t.Error("DBSC must require a reliable lock view")

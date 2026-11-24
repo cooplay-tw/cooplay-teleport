@@ -89,6 +89,7 @@ type dbscCredential struct {
 
 // LockWatcher checks the proxy's existing view of active locks.
 type LockWatcher interface {
+	IsInitialized() bool
 	CheckLockInForce(constants.LockingMode, ...types.LockTarget) error
 }
 
@@ -110,7 +111,7 @@ func (h *Handler) checkDBSCSession(w http.ResponseWriter, r *http.Request, ws ty
 	}
 	now := h.c.Clock.Now()
 	if ws.Expiry().After(now) && identity.Expires.After(now) {
-		if h.c.LockWatcher == nil {
+		if h.c.LockWatcher == nil || !h.c.LockWatcher.IsInitialized() {
 			return false, trace.ConnectionProblem(nil, "app session lock check unavailable")
 		}
 		targets := slices.Collect(services.LockTargetsFromTLSIdentity(*identity))
