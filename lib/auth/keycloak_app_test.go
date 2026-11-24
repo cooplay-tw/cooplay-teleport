@@ -262,6 +262,19 @@ func TestKeycloakManagedAppCredentialRevocation(t *testing.T) {
 			for _, identity := range otherApps {
 				requireKeycloakLock(t, f, identity, otherRevoked)
 			}
+			checkAppSessions := func(identities []tlsca.Identity, deleted bool) {
+				t.Helper()
+				for _, identity := range identities {
+					_, err := f.a.AuthServer.GetAppSession(f.ctx, types.GetAppSessionRequest{SessionID: identity.RouteToApp.SessionID})
+					if deleted {
+						require.True(t, trace.IsNotFound(err), "revoked app session lookup error type: %T", err)
+					} else {
+						require.NoError(t, err)
+					}
+				}
+			}
+			checkAppSessions(firstApps, reason != "outage")
+			checkAppSessions(otherApps, otherRevoked && reason != "outage")
 			// Durable state denies new app credentials immediately, without
 			// waiting for lock propagation to the Auth cache.
 			_, err := coderAppCert(f, srv, first)
@@ -309,4 +322,36 @@ func TestKeycloakManagedAppCredentialRevocation(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestKeycloakStartupSweepsLockedAppSessions(t *testing.T) {
+	f, _, cfg, srv := managedCoderFixture(t)
+	first := managedConsoleLogin(t, f, srv, "sid-a")
+	other := managedConsoleLogin(t, f, srv, "sid-b")
+	require.Equal(t, first.username, other.username)
+
+	lockedApp, err := coderAppSession(f, srv, first)
+	require.NoError(t, err)
+	unlockedApp, err := coderAppSession(f, srv, other)
+	require.NoError(t, err)
+	activeLock, err := types.NewLock("existing-login-lock", types.LockSpecV2{Target: types.LockTarget{Role: first.marker}})
+	require.NoError(t, err)
+	require.NoError(t, f.a.AuthServer.UpsertLock(f.ctx, activeLock))
+	expiredAt := f.clock.Now().Add(-time.Second)
+	expiredLock, err := types.NewLock("expired-login-lock", types.LockSpecV2{
+		Target: types.LockTarget{Role: other.marker}, Expires: &expiredAt,
+	})
+	require.NoError(t, err)
+	require.NoError(t, f.a.AuthServer.UpsertLock(f.ctx, expiredLock))
+
+	// Simulate a pre-upgrade lock. It denies the old credentials, while the
+	// app session inserted by the old release still exists until the sweep.
+	_, err = f.a.AuthServer.GetAppSession(f.ctx, types.GetAppSessionRequest{SessionID: lockedApp.GetName()})
+	require.NoError(t, err)
+	_, err = auth.NewManagedKeycloakService(f.a.AuthServer, cfg)
+	require.NoError(t, err)
+	_, err = f.a.AuthServer.GetAppSession(f.ctx, types.GetAppSessionRequest{SessionID: lockedApp.GetName()})
+	require.True(t, trace.IsNotFound(err), "swept app session lookup error type: %T", err)
+	_, err = f.a.AuthServer.GetAppSession(f.ctx, types.GetAppSessionRequest{SessionID: unlockedApp.GetName()})
+	require.NoError(t, err)
 }

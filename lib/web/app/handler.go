@@ -45,6 +45,7 @@ import (
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
 	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/readonly"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
@@ -58,6 +59,8 @@ type HandlerConfig struct {
 	AuthClient authclient.ClientI
 	// AccessPoint is caching client to auth.
 	AccessPoint authclient.ProxyAccessPoint
+	// LockWatcher tracks locks that affect application credentials.
+	LockWatcher LockWatcher
 	// ClusterGetter holds connections to leaf clusters.
 	ClusterGetter reversetunnelclient.ClusterGetter
 	// ProxyPublicAddrs contains web proxy public addresses.
@@ -596,7 +599,7 @@ func (h *Handler) checkForDualCredentialMismatch(outerIdentity *tlsca.Identity, 
 	if outerIdentity.Username != innerWS.GetUser() {
 		return trace.AccessDenied("user %q does not match session user %q", outerIdentity.Username, innerWS.GetUser())
 	}
-	innerIdentity, err := getIdentityFromWebSession(innerWS)
+	innerIdentity, err := services.WebSessionTLSIdentity(innerWS)
 	if err != nil {
 		return trace.AccessDenied("cannot extract identity from session: %s", err)
 	}

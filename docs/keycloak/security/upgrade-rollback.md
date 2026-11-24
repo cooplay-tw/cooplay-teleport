@@ -69,6 +69,11 @@ redirect when a browser starts Keycloak web SSO without a CSRF cookie. The new
 previous multi-tab flow. Verify that revocation records and locks still deny
 the credentials they cover after rollback.
 
+The `v18.11.1-cooplay.8` startup sweep removes app sessions already covered by
+active Keycloak login-role locks. A binary rollback to `v18.11.1-cooplay.7`
+leaves those app sessions deleted and retains their revocation locks. The
+release uses the existing configuration and session, journal and lock formats.
+
 For a rollback that removes this connector:
 
 1. Close the affected ingress and stop all credential issuers. Preserve current

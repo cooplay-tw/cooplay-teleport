@@ -19,8 +19,10 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,8 +32,11 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
 
+	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/jwt"
+	"github.com/gravitational/teleport/lib/services"
 )
 
 const (
@@ -82,6 +87,71 @@ type dbscCredential struct {
 	Attributes string `json:"attributes"`
 }
 
+// LockWatcher checks the proxy's existing view of active locks.
+type LockWatcher interface {
+	CheckLockInForce(constants.LockingMode, ...types.LockTarget) error
+}
+
+func (h *Handler) getDBSCSession(w http.ResponseWriter, r *http.Request, sessionID string) (types.WebSession, error) {
+	// Use Auth directly so a stale proxy cache cannot refresh a deleted session.
+	ws, err := h.c.AuthClient.GetAppSession(r.Context(), types.GetAppSessionRequest{SessionID: sessionID})
+	if trace.IsNotFound(err) {
+		return nil, terminateDBSCSession(w, r, sessionID)
+	}
+	return ws, trace.Wrap(err)
+}
+
+// checkDBSCSession returns false after writing a termination response, or an
+// error when renewal must wait for a reliable lock view.
+func (h *Handler) checkDBSCSession(w http.ResponseWriter, r *http.Request, ws types.WebSession) (bool, error) {
+	identity, err := services.WebSessionTLSIdentity(ws)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	now := h.c.Clock.Now()
+	if ws.Expiry().After(now) && identity.Expires.After(now) {
+		if h.c.LockWatcher == nil {
+			return false, trace.ConnectionProblem(nil, "app session lock check unavailable")
+		}
+		targets := slices.Collect(services.LockTargetsFromTLSIdentity(*identity))
+		err := h.c.LockWatcher.CheckLockInForce(constants.LockingModeStrict, targets...)
+		if err == nil {
+			return true, nil
+		}
+		var lockErr trace.Error
+		var lock types.Lock
+		if errors.As(err, &lockErr) {
+			lock, _ = lockErr.GetFields()["lock-in-force"].(types.Lock)
+		}
+		if lock == nil || auth.IsKeycloakHealthLock(lock) {
+			// Preserve sessions through an Auth restart, a connector outage or
+			// a stale watcher. Chrome retries refreshes that return a 5xx.
+			return false, trace.ConnectionProblem(nil, "app session lock check temporarily unavailable")
+		}
+	}
+
+	if err := h.c.AuthClient.DeleteAppSession(r.Context(), types.DeleteAppSessionRequest{SessionID: ws.GetName()}); err != nil && !trace.IsNotFound(err) {
+		h.logger.WarnContext(r.Context(), "Failed to delete revoked or expired DBSC app session")
+	}
+	return false, terminateDBSCSession(w, r, ws.GetName())
+}
+
+func terminateDBSCSession(w http.ResponseWriter, r *http.Request, sessionID string) error {
+	// DBSC termination does not remove ordinary cookies. Preserve a different
+	// app session cookie if this refresh arrived after a newer app launch.
+	if cookie, err := r.Cookie(CookieName); err != nil || cookie.Value == sessionID {
+		expireCookie(w, CookieName)
+		expireCookie(w, SubjectCookieName)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	// Chromium checks the session identifier before reading "continue".
+	return trace.Wrap(json.NewEncoder(w).Encode(struct {
+		SessionIdentifier string `json:"session_identifier"`
+		Continue          bool   `json:"continue"`
+	}{SessionIdentifier: sessionID, Continue: false}))
+}
+
 // handleDBSCRegistration handles DBSC registration from the browser.
 // The browser POSTs a signed JWT proving possession of the private key.
 func (h *Handler) handleDBSCRegistration(w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
@@ -102,13 +172,17 @@ func (h *Handler) handleDBSCRegistration(w http.ResponseWriter, r *http.Request,
 		return trace.AccessDenied("missing subject session cookie")
 	}
 
-	ws, err := h.getAppSessionFromAccessPoint(ctx, sessionID)
-	if err != nil {
-		return trace.Wrap(err)
+	ws, err := h.getDBSCSession(w, r, sessionID)
+	if err != nil || ws == nil {
+		return err
 	}
 
 	if err := checkSubjectToken(subjectCookie.Value, ws); err != nil {
 		return trace.Wrap(err)
+	}
+
+	if ok, err := h.checkDBSCSession(w, r, ws); !ok {
+		return err
 	}
 
 	responseJWT, ok, err := getDBSCHeaderString(r, secureSessionResponseHeader)
@@ -120,6 +194,9 @@ func (h *Handler) handleDBSCRegistration(w http.ResponseWriter, r *http.Request,
 	}
 
 	if err := h.c.AuthClient.SetAppSessionDBSCPublicKey(ctx, sessionID, []byte(responseJWT)); err != nil {
+		if trace.IsNotFound(err) {
+			return terminateDBSCSession(w, r, sessionID)
+		}
 		return trace.Wrap(err)
 	}
 
@@ -143,13 +220,16 @@ func (h *Handler) handleDBSCRefresh(w http.ResponseWriter, r *http.Request, p ht
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if !ok {
+	if !ok || sessionID == "" {
 		return trace.BadParameter("missing %s header", secureSessionIDHeader)
 	}
 
-	ws, err := h.getAppSessionFromAccessPoint(ctx, sessionID)
-	if err != nil {
-		return trace.Wrap(err)
+	ws, err := h.getDBSCSession(w, r, sessionID)
+	if err != nil || ws == nil {
+		return err
+	}
+	if ok, err := h.checkDBSCSession(w, r, ws); !ok {
+		return err
 	}
 
 	storedPublicKey := ws.GetDBSCPublicKey()
@@ -164,6 +244,9 @@ func (h *Handler) handleDBSCRefresh(w http.ResponseWriter, r *http.Request, p ht
 	if !ok {
 		challenge, err := h.c.AuthClient.SignDBSCChallenge(ctx, sessionID)
 		if err != nil {
+			if trace.IsNotFound(err) {
+				return terminateDBSCSession(w, r, sessionID)
+			}
 			return trace.Wrap(err)
 		}
 		w.Header().Set(secureSessionChallengeHeader, fmt.Sprintf(`%s;id=%s`, strconv.Quote(challenge), strconv.Quote(sessionID)))

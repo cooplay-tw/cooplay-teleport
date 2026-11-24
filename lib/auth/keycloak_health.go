@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
@@ -17,8 +18,19 @@ import (
 	"github.com/gravitational/teleport/lib/services/local"
 )
 
+const keycloakHealthLockPrefix = "keycloak-health-"
+
 func keycloakHealthLockName(connector string) string {
-	return "keycloak-health-" + keycloakDigest(connector)
+	return keycloakHealthLockPrefix + keycloakDigest(connector)
+}
+
+// IsKeycloakHealthLock distinguishes the temporary reconciliation fence from
+// a lock revoking a specific login or account.
+func IsKeycloakHealthLock(lock types.Lock) bool {
+	role := lock.Target().Role
+	digest, ok := strings.CutPrefix(role, keycloakGuardPrefix)
+	return ok && lock.Target() == (types.LockTarget{Role: role}) &&
+		lock.GetName() == keycloakHealthLockPrefix+digest
 }
 
 func (s *keycloakService) lastKeycloakHealth(ctx context.Context, connector string) time.Time {

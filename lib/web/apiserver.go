@@ -267,6 +267,8 @@ type Config struct {
 
 	// AccessPoint holds a cache to the Auth Server.
 	AccessPoint authclient.ProxyAccessPoint
+	// LockWatcher is the proxy's existing view of active locks.
+	LockWatcher app.LockWatcher
 
 	// Emitter is event emitter
 	Emitter apievents.Emitter
@@ -829,6 +831,7 @@ func NewHandler(cfg Config, opts ...HandlerOption) (*APIHandler, error) {
 			Clock:                 h.clock,
 			AuthClient:            cfg.ProxyClient,
 			AccessPoint:           cfg.AccessPoint,
+			LockWatcher:           cfg.LockWatcher,
 			ClusterGetter:         cfg.Proxy,
 			CipherSuites:          cfg.CipherSuites,
 			ProxyPublicAddrs:      cfg.ProxyPublicAddrs,

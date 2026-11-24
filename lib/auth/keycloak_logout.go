@@ -57,7 +57,7 @@ func (a *ServerWithRoles) KeycloakLogout(ctx context.Context, req authclient.Key
 	if json.Unmarshal(item.Value, &login) != nil || login.Username != identity.Username || login.Marker != marker {
 		return trace.AccessDenied("Keycloak login identity mismatch")
 	}
-	return s.persistRevocation(ctx, "roles", marker, types.LockTarget{Role: marker}, "current-login-logout", login.Expires.Add(24*time.Hour))
+	return s.persistRevocation(ctx, login.Username, types.LockTarget{Role: marker}, "current-login-logout", login.Expires.Add(24*time.Hour))
 }
 
 func (s *keycloakService) backchannelLogout(ctx context.Context, connector, raw string) error {
@@ -163,7 +163,7 @@ func (s *keycloakService) backchannelLogout(ctx context.Context, connector, raw 
 			(token.Subject != "" && login.Subject != token.Subject) || (claims.SID == "" && login.Issued.Unix() > token.IssuedAt.Unix()) {
 			return nil
 		}
-		return s.persistRevocation(ctx, "roles", login.Marker, types.LockTarget{Role: login.Marker}, "idp-logout", login.Expires.Add(24*time.Hour))
+		return s.persistRevocation(ctx, login.Username, types.LockTarget{Role: login.Marker}, "idp-logout", login.Expires.Add(24*time.Hour))
 	})
 }
 

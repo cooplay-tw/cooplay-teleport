@@ -38,7 +38,18 @@ import (
 	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/tlsca"
 )
+
+// WebSessionTLSIdentity extracts the identity from a web session's TLS certificate.
+func WebSessionTLSIdentity(session types.WebSession) (*tlsca.Identity, error) {
+	cert, err := tlsca.ParseCertificatePEM(session.GetTLSCert())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	identity, err := tlsca.FromSubject(cert.Subject, cert.NotAfter)
+	return identity, trace.Wrap(err)
+}
 
 // UserGetter is responsible for getting users
 type UserGetter interface {

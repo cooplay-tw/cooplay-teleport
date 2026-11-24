@@ -5679,6 +5679,7 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
 			CipherSuites:              cfg.CipherSuites,
 			FIPS:                      cfg.FIPS,
 			AccessPoint:               accessPoint,
+			LockWatcher:               lockWatcher,
 			Emitter:                   asyncEmitter,
 			PluginRegistry:            process.PluginRegistry,
 			HostUUID:                  conn.HostUUID(),

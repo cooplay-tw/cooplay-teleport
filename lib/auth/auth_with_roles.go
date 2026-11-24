@@ -7182,11 +7182,7 @@ func (a *ServerWithRoles) authorizeDBSCRequest(ctx context.Context, sessionID st
 }
 
 func getAppSessionRouteClusterName(session types.WebSession) (string, error) {
-	cert, err := tlsca.ParseCertificatePEM(session.GetTLSCert())
-	if err != nil {
-		return "", trace.Wrap(err, "parsing app session TLS cert")
-	}
-	identity, err := tlsca.FromSubject(cert.Subject, cert.NotAfter)
+	identity, err := services.WebSessionTLSIdentity(session)
 	if err != nil {
 		return "", trace.Wrap(err, "parsing app session identity")
 	}

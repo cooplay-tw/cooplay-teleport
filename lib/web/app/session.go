@@ -28,8 +28,8 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/app/common"
-	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 // session holds a request forwarder and web session for this request.
@@ -42,21 +42,10 @@ type session struct {
 	tr *transport
 }
 
-// getIdentityFromWebSession parses the TLS certificate from the web session and
-// extracts the user identity from its subject.
-func getIdentityFromWebSession(ws types.WebSession) (*tlsca.Identity, error) {
-	certificate, err := tlsca.ParseCertificatePEM(ws.GetTLSCert())
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	identity, err := tlsca.FromSubject(certificate.Subject, certificate.NotAfter)
-	return identity, trace.Wrap(err)
-}
-
 // newSession creates a new session.
 func (h *Handler) newSession(ctx context.Context, ws types.WebSession) (*session, error) {
 	// Extract the identity of the user.
-	identity, err := getIdentityFromWebSession(ws)
+	identity, err := services.WebSessionTLSIdentity(ws)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
